@@ -1,3 +1,4 @@
+<img width="300" height="100" alt="logo" src="https://github.com/user-attachments/assets/ba43b72a-e152-4e90-a2f7-4981f88008f7" />
 # Emby Manager · Emby 用户管理系统
 
 ![Python](https://img.shields.io/badge/Python-3.10%20~%203.12-3776AB?logo=python&logoColor=white)
