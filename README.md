@@ -1,6 +1,6 @@
 # Emby Manager · Emby 用户管理系统
 
-![Python](https://img.shields.io/badge/Python-3.8%20~%203.13-3776AB?logo=python&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.10%20~%203.12-3776AB?logo=python&logoColor=white)
 ![Flask](https://img.shields.io/badge/Flask-2.3%2B-000000?logo=flask)
 ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)
 ![Database](https://img.shields.io/badge/Database-SQLite-003B57?logo=sqlite&logoColor=white)
