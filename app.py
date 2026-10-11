@@ -16,6 +16,8 @@ from datetime import datetime, timedelta
 from functools import wraps
 from threading import Thread
 import time
+import contextvars
+from contextlib import contextmanager
 
 from flask import Flask, request, jsonify, session, render_template, redirect, url_for, flash, send_from_directory, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -259,8 +261,10 @@ class User(Base):
     email = Column(String(100), nullable=True, unique=True)
     email_verified = Column(Boolean, default=False)
     emby_access_disabled = Column(Boolean, default=False, nullable=False)  # Emby访问是否因过期被系统自动禁用
+    emby_server_id = Column(Integer, ForeignKey('emby_servers.id'), nullable=True, index=True)  # 用户所属的Emby媒体库
 
     watch_history = relationship("WatchHistory", back_populates="user", cascade="all, delete-orphan")
+    emby_server = relationship("EmbyServer", foreign_keys=[emby_server_id])
     login_logs = relationship("LoginLog", back_populates="user", cascade="all, delete-orphan")
     used_activation_codes = relationship("ActivationCode", back_populates="used_by_user")
     coin_transactions = relationship("CoinTransaction", back_populates="user", cascade="all, delete-orphan", foreign_keys="CoinTransaction.user_id")
@@ -301,7 +305,9 @@ class User(Base):
             'coins': self.coins,
             'email': self.email,
             'email_verified': self.email_verified,
-            'emby_access_disabled': bool(self.emby_access_disabled)
+            'emby_access_disabled': bool(self.emby_access_disabled),
+            'emby_server_id': self.emby_server_id,
+            'emby_server_name': self.emby_server.name if self.emby_server else None
         }
 
 class ActivationCode(Base):
@@ -372,6 +378,49 @@ class SystemConfig(Base):
             'id': self.id,
             'key': self.key,
             'value': self.value
+        }
+
+class EmbyServer(Base):
+    """Emby媒体服务器表（支持绑定多个媒体库）"""
+    __tablename__ = 'emby_servers'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), nullable=False)  # 媒体库名称
+    server_url = Column(String(500), nullable=False)  # API管理地址（含端口）
+    api_key = Column(String(255), nullable=False)  # API密钥
+    # 面向用户展示的多个访问地址（JSON数组：[{"label":"域名","url":"https://a.com:8920","host":"a.com","port":"8920"}]）
+    addresses = Column(Text, nullable=True)
+    is_active = Column(Boolean, default=True, nullable=False)
+    # 最近一次测试连接的缓存信息
+    last_status = Column(String(20), default='unknown', nullable=False)  # ok / fail / unknown
+    server_version = Column(String(100), nullable=True)
+    last_tested_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+    def get_addresses(self):
+        """解析用户访问地址列表"""
+        if not self.addresses:
+            return []
+        try:
+            data = json.loads(self.addresses)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def to_dict(self, include_key=False, user_count=None):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'server_url': self.server_url,
+            'api_key': self.api_key if include_key else '***',
+            'addresses': self.get_addresses(),
+            'is_active': bool(self.is_active),
+            'last_status': self.last_status,
+            'server_version': self.server_version,
+            'last_tested_at': self.last_tested_at.isoformat() if self.last_tested_at else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'user_count': user_count
         }
 
 class LoginLog(Base):
@@ -1419,7 +1468,14 @@ def init_db():
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE users ADD COLUMN coins INTEGER NOT NULL DEFAULT 0"))
         logger.info("数据库迁移：添加 coins 列")
-    
+
+    # 添加 emby_server_id 列（多Emby媒体库支持）
+    if 'emby_server_id' not in columns:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE users ADD COLUMN emby_server_id INTEGER"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_users_emby_server_id ON users (emby_server_id)"))
+        logger.info("数据库迁移：添加 users.emby_server_id 列")
+
     # 删除旧的列（如果存在）
     if 'is_manually_disabled' in columns:
         # SQLite 不支持直接删除列，需要重建表
@@ -1682,6 +1738,32 @@ def init_db():
             db.add(email_config)
             logger.info("初始化默认邮件配置")
         
+        # ===== 多Emby媒体库：从旧版单库配置迁移并回填存量用户 =====
+        legacy_url = db.query(SystemConfig).filter_by(key='emby_server_url').first()
+        legacy_key = db.query(SystemConfig).filter_by(key='emby_api_key').first()
+        legacy_url_val = (legacy_url.value or '').strip() if legacy_url else ''
+        legacy_key_val = (legacy_key.value or '').strip() if legacy_key else ''
+        first_server = db.query(EmbyServer).order_by(EmbyServer.id.asc()).first()
+        if not first_server and legacy_url_val and legacy_key_val:
+            first_server = EmbyServer(
+                name='默认媒体库',
+                server_url=legacy_url_val.rstrip('/'),
+                api_key=legacy_key_val,
+                addresses=json.dumps([], ensure_ascii=False),
+                is_active=True,
+                last_status='unknown'
+            )
+            db.add(first_server)
+            db.flush()
+            logger.info("多库迁移：已从旧版单库配置创建默认媒体库")
+        # 存量用户回填到第一个媒体库
+        if first_server:
+            unassigned = db.query(User).filter(User.emby_server_id.is_(None)).all()
+            for u in unassigned:
+                u.emby_server_id = first_server.id
+            if unassigned:
+                logger.info(f"多库迁移：已将 {len(unassigned)} 个存量用户回填到媒体库 {first_server.name}")
+
         db.commit()
         logger.info("数据库初始化完成")
     except Exception as e:
@@ -1694,7 +1776,7 @@ def init_db():
 app = Flask(__name__, 
             template_folder='templates',
             static_folder='static')
-app.secret_key = secrets.token_hex(32)
+app.secret_key = os.environ.get('EMBY_MANAGER_SECRET_KEY') or secrets.token_hex(32)
 app.config['SESSION_TYPE'] = 'filesystem'
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)
 
@@ -1781,9 +1863,10 @@ def ban_user_for_suspicious_activity(user_id, reason):
             logger.warning(f"用户因可疑活动被封禁 - 用户ID: {user_id}, 用户名: {user.username}, 原因: {reason}")
 
             # 同步禁用Emby用户
-            if user.emby_user_id and EmbyAPI.is_configured():
+            if user.emby_user_id and EmbyAPI.is_configured(user.emby_server_id):
                 try:
-                    emby_result = EmbyAPI.disable_user(user.emby_user_id)
+                    with EmbyAPI.server_context(user.emby_server_id):
+                        emby_result = EmbyAPI.disable_user(user.emby_user_id)
                     if emby_result:
                         logger.info(f"Emby用户已同步禁用: {user.username} (Emby ID: {user.emby_user_id})")
                     else:
@@ -1841,8 +1924,9 @@ def monitor_emby_policies():
                 continue
 
             try:
-                # 获取当前策略
-                current_policy = EmbyAPI.get_user_policy(emby_user_id)
+                # 获取当前策略（按用户所属媒体库切换上下文）
+                with EmbyAPI.server_context(user.emby_server_id):
+                    current_policy = EmbyAPI.get_user_policy(emby_user_id)
                 if current_policy is None:
                     logger.warning(f"无法获取用户策略: {user.username} (Emby ID: {emby_user_id})")
                     continue
@@ -2272,34 +2356,130 @@ def set_config(key, value):
         db.close()
 
 # ============== Emby API 集成 ==============
+# 当前线程/协程正在操作的Emby媒体库ID（多库支持）
+_emby_server_ctx = contextvars.ContextVar('emby_server_ctx', default=None)
+
 class EmbyAPI:
     @staticmethod
-    def get_server_url():
-        return get_config('emby_server_url', '')
-    
+    @contextmanager
+    def server_context(server_id):
+        """临时切换当前操作的Emby媒体库上下文
+
+        用法:
+            with EmbyAPI.server_context(user.emby_server_id):
+                EmbyAPI.disable_user(user.emby_user_id)
+        """
+        token = _emby_server_ctx.set(server_id)
+        try:
+            yield
+        finally:
+            _emby_server_ctx.reset(token)
+
     @staticmethod
-    def get_api_key():
-        return get_config('emby_api_key', '')
-    
+    def _resolve_server(server_id=None):
+        """解析当前应使用的媒体库，返回 (server_url, api_key, server_id)
+
+        优先级：显式参数 > 上下文 > 第一个启用的媒体库 > 旧版全局配置（兜底）
+        """
+        sid = server_id if server_id is not None else _emby_server_ctx.get()
+        try:
+            db = SessionLocal()
+            try:
+                srv = None
+                if sid is not None:
+                    srv = db.query(EmbyServer).get(sid)
+                if srv is None:
+                    srv = db.query(EmbyServer).filter_by(is_active=True).order_by(EmbyServer.id.asc()).first()
+                if srv:
+                    return (srv.server_url or '').rstrip('/'), srv.api_key or '', srv.id
+            finally:
+                db.close()
+        except Exception as e:
+            logger.error(f"解析Emby媒体库失败: {e}")
+        # 旧版单库配置兜底
+        return (get_config('emby_server_url', '') or '').rstrip('/'), get_config('emby_api_key', '') or '', None
+
     @staticmethod
-    def is_configured():
-        return bool(EmbyAPI.get_server_url() and EmbyAPI.get_api_key())
-    
+    def get_all_servers(active_only=True):
+        """获取所有已绑定的媒体库（返回轻量字典列表，避免分离对象问题）"""
+        try:
+            db = SessionLocal()
+            try:
+                q = db.query(EmbyServer)
+                if active_only:
+                    q = q.filter_by(is_active=True)
+                rows = q.order_by(EmbyServer.id.asc()).all()
+                return [{
+                    'id': r.id,
+                    'name': r.name,
+                    'server_url': r.server_url,
+                    'api_key': r.api_key,
+                    'is_active': bool(r.is_active),
+                } for r in rows]
+            finally:
+                db.close()
+        except Exception as e:
+            logger.error(f"获取Emby媒体库列表失败: {e}")
+            return []
+
     @staticmethod
-    def get_headers():
+    def get_server_url(server_id=None):
+        return EmbyAPI._resolve_server(server_id)[0]
+
+    @staticmethod
+    def get_api_key(server_id=None):
+        return EmbyAPI._resolve_server(server_id)[1]
+
+    @staticmethod
+    def is_configured(server_id=None):
+        url, key, _ = EmbyAPI._resolve_server(server_id)
+        return bool(url and key)
+
+    @staticmethod
+    def get_headers(server_id=None):
         return {
-            'X-Emby-Token': EmbyAPI.get_api_key(),
+            'X-Emby-Token': EmbyAPI.get_api_key(server_id),
             'Content-Type': 'application/json'
         }
-    
+
     @staticmethod
-    def get_users():
+    def test_server_connection(server_url, api_key):
+        """测试指定的Emby服务器连接，返回 (是否成功, 版本号, 错误信息)"""
+        if not server_url or not api_key:
+            return False, '', '服务器地址和API密钥不能为空'
+        server_url = server_url.rstrip('/')
+        try:
+            url = f"{server_url}/System/Info"
+            response = requests.get(
+                url,
+                headers={'X-Emby-Token': api_key, 'Accept': 'application/json'},
+                timeout=10
+            )
+            if response.status_code == 200:
+                data = response.json()
+                version = data.get('Version', '')
+                server_name = data.get('ServerName', '')
+                return True, version, server_name
+            elif response.status_code == 401:
+                return False, '', 'API密钥无效（401未授权）'
+            else:
+                return False, '', f'服务器返回 HTTP {response.status_code}'
+        except requests.exceptions.ConnectTimeout:
+            return False, '', '连接超时，请检查地址和端口'
+        except requests.exceptions.ConnectionError:
+            return False, '', '无法连接到服务器，请检查地址是否正确'
+        except Exception as e:
+            return False, '', f'连接失败: {str(e)}'
+
+
+    @staticmethod
+    def get_users(server_id=None):
         """获取Emby用户列表"""
-        if not EmbyAPI.is_configured():
+        if not EmbyAPI.is_configured(server_id):
             return None
         try:
-            url = f"{EmbyAPI.get_server_url()}/emby/Users"
-            response = requests.get(url, headers=EmbyAPI.get_headers(), timeout=10)
+            url = f"{EmbyAPI.get_server_url(server_id)}/emby/Users"
+            response = requests.get(url, headers=EmbyAPI.get_headers(server_id), timeout=10)
             if response.status_code == 200:
                 return response.json()
             return None
@@ -2616,6 +2796,54 @@ class EmbyAPI:
             return False
     
     @staticmethod
+    def resolve_folder_guids(folder_ids, server_id=None):
+        """将界面上使用的媒体库文件夹ID转换为Emby策略所需的GUID形式
+
+        Emby 的 /Library/VirtualFolders 返回的 ItemId 可能是数字ID，
+        但用户策略 Policy.EnabledFolders 必须使用文件夹GUID，
+        直接提交数字ID会导致除合集外的所有媒体库被禁止访问。
+
+        Args:
+            folder_ids: 管理员配置的文件夹ID列表（可能是数字ID或GUID）
+            server_id: 媒体库ID（多库上下文）
+
+        Returns:
+            list: 可直接用于 EnabledFolders 的ID列表；查询失败时原样返回
+        """
+        if not folder_ids:
+            return []
+        try:
+            url = f"{EmbyAPI.get_server_url(server_id).rstrip('/')}/emby/Library/MediaFolders"
+            resp = requests.get(url, headers=EmbyAPI.get_headers(server_id), timeout=10)
+            if resp.status_code != 200:
+                logger.warning(f"获取媒体文件夹GUID映射失败 HTTP {resp.status_code}，使用原始ID")
+                return list(folder_ids)
+            id_to_guid = {}
+            for item in resp.json().get('Items', []):
+                num_id = str(item.get('Id') or '')
+                guid = item.get('Guid') or num_id
+                if num_id:
+                    id_to_guid[num_id] = guid
+            resolved = []
+            for fid in folder_ids:
+                fid_s = str(fid)
+                # 已经是GUID（32位十六进制，可含连字符）则直接使用
+                hex_part = fid_s.replace('-', '')
+                if len(hex_part) == 32:
+                    try:
+                        int(hex_part, 16)
+                        resolved.append(fid_s)
+                        continue
+                    except ValueError:
+                        pass
+                resolved.append(id_to_guid.get(fid_s, fid_s))
+            logger.info(f"媒体库文件夹ID转换: {list(folder_ids)} -> {resolved}")
+            return resolved
+        except Exception as e:
+            logger.warning(f"转换媒体库文件夹GUID失败，使用原始ID: {e}")
+            return list(folder_ids)
+
+    @staticmethod
     def apply_default_policy(emby_user_id, is_disabled=False):
         """应用默认用户策略到新创建的Emby用户
 
@@ -2650,7 +2878,9 @@ class EmbyAPI:
                 logger.warning(f"获取Emby用户信息失败（不影响策略应用）: {e}")
             
             # 从数据库获取默认策略
-            db = get_db()
+            # 注意：必须使用独立SessionLocal，不能用get_db()（scoped session），
+            # 否则在请求线程中会关闭路由正在使用的会话，导致路由中的User实例被分离
+            db = SessionLocal()
             try:
                 policy_record = db.query(EmbyUserPolicy).filter_by(is_default=True).first()
                 if policy_record:
@@ -2658,6 +2888,13 @@ class EmbyAPI:
                     enable_transcoding = policy_record.enable_transcoding
                     max_active_devices = policy_record.max_active_devices
                     allowed_library_ids = json.loads(policy_record.allowed_library_ids) if policy_record.allowed_library_ids else []
+                    # 多媒体库：allowed_library_ids 支持 {"<媒体库ID>": [文件夹ID...]} 形式
+                    _, _, _ctx_sid = EmbyAPI._resolve_server()
+                    if isinstance(allowed_library_ids, dict):
+                        if _ctx_sid is not None and str(_ctx_sid) in allowed_library_ids:
+                            allowed_library_ids = allowed_library_ids[str(_ctx_sid)] or []
+                        else:
+                            allowed_library_ids = []
                     logger.info(f"从数据库获取默认策略: 下载={enable_download}, 转码={enable_transcoding}, 最大设备={max_active_devices}, 媒体库={allowed_library_ids}")
                 else:
                     # 使用硬编码默认值
@@ -2675,7 +2912,11 @@ class EmbyAPI:
             # - 其他非空数组：只允许访问指定的媒体库
             is_no_library_access = allowed_library_ids == ['__NONE__']
             enable_all_folders = len(allowed_library_ids) == 0 or is_no_library_access
-            enabled_folders = [] if is_no_library_access else allowed_library_ids
+            if is_no_library_access:
+                enabled_folders = []
+            else:
+                # Emby策略EnabledFolders必须使用文件夹GUID（界面配置的可能是数字ID）
+                enabled_folders = EmbyAPI.resolve_folder_guids(allowed_library_ids)
             
             # 构建Emby Policy对象
             # 参考Emby API文档: https://api.emby.media/#operation/UserPolicyController_UpdateUserPolicy
@@ -3023,13 +3264,13 @@ class EmbyAPI:
             return False
 
     @staticmethod
-    def get_libraries():
+    def get_libraries(server_id=None):
         """获取Emby媒体库列表"""
-        if not EmbyAPI.is_configured():
+        if not EmbyAPI.is_configured(server_id):
             return None
         try:
-            url = f"{EmbyAPI.get_server_url()}/emby/Library/VirtualFolders"
-            response = requests.get(url, headers=EmbyAPI.get_headers(), timeout=10)
+            url = f"{EmbyAPI.get_server_url(server_id)}/emby/Library/VirtualFolders"
+            response = requests.get(url, headers=EmbyAPI.get_headers(server_id), timeout=10)
             if response.status_code == 200:
                 libraries = response.json()
                 # 返回简化格式
@@ -3098,7 +3339,7 @@ class EmbyAPI:
             return None
 
     @staticmethod
-    def get_items_by_ids_admin(item_ids):
+    def get_items_by_ids_admin(item_ids, server_id=None):
         """管理员批量获取Emby项目详细信息（不依赖具体用户ID）
 
         Args:
@@ -3107,11 +3348,11 @@ class EmbyAPI:
         Returns:
             dict: 包含Items字段的字典，或None如果失败
         """
-        if not EmbyAPI.is_configured() or not item_ids:
+        if not EmbyAPI.is_configured(server_id) or not item_ids:
             return None
         try:
-            server_url = EmbyAPI.get_server_url().rstrip('/')
-            api_key = EmbyAPI.get_api_key()
+            server_url = EmbyAPI.get_server_url(server_id).rstrip('/')
+            api_key = EmbyAPI.get_api_key(server_id)
             url = f"{server_url}/emby/Items"
             params = {
                 'api_key': api_key,
@@ -3127,17 +3368,31 @@ class EmbyAPI:
             return None
 
     @staticmethod
-    def get_active_sessions():
+    def get_active_sessions(server_id=None):
         """获取Emby当前活跃的播放会话
-        
+
         Returns:
             list: 活跃会话列表，每个会话包含播放信息
         """
-        if not EmbyAPI.is_configured():
+        _, _, resolved_sid = EmbyAPI._resolve_server(server_id)
+        if not EmbyAPI.is_configured(server_id):
             return []
+        # 查询媒体库名称（用于多库区分）
+        server_name = ''
         try:
-            server_url = EmbyAPI.get_server_url().rstrip('/')
-            api_key = EmbyAPI.get_api_key()
+            if resolved_sid is not None:
+                _db = SessionLocal()
+                try:
+                    _srv = _db.query(EmbyServer).get(resolved_sid)
+                    if _srv:
+                        server_name = _srv.name
+                finally:
+                    _db.close()
+        except Exception:
+            pass
+        try:
+            server_url = EmbyAPI.get_server_url(server_id).rstrip('/')
+            api_key = EmbyAPI.get_api_key(server_id)
             url = f"{server_url}/emby/Sessions"
             params = {
                 'api_key': api_key
@@ -3153,7 +3408,7 @@ class EmbyAPI:
                     user_id = session.get('UserId')
                     now_playing = session.get('NowPlayingItem')
                     last_played_item = session.get('LastPlayedItem')
-                    
+
                     # 如果有正在播放的项目
                     if now_playing:
                         active_sessions.append({
@@ -3167,7 +3422,9 @@ class EmbyAPI:
                             'season_name': now_playing.get('SeasonName', ''),
                             'position_ticks': session.get('PlayState', {}).get('PositionTicks', 0),
                             'is_paused': session.get('PlayState', {}).get('IsPaused', False),
-                            'is_now_playing': True
+                            'is_now_playing': True,
+                            'emby_server_id': resolved_sid,
+                            'emby_server_name': server_name
                         })
                     # 如果有最近播放的项目（但当前没在播放）
                     elif last_played_item:
@@ -3182,7 +3439,9 @@ class EmbyAPI:
                             'season_name': last_played_item.get('SeasonName', ''),
                             'position_ticks': 0,
                             'is_paused': False,
-                            'is_now_playing': False
+                            'is_now_playing': False,
+                            'emby_server_id': resolved_sid,
+                            'emby_server_name': server_name
                         })
                 return active_sessions
             return []
@@ -3605,8 +3864,9 @@ class EmbyAPI:
             if not emby_data or 'Items' not in emby_data:
                 logger.warning(f"获取Emby观看历史失败或没有数据: emby_user_id={emby_user_id}")
                 return False
-            
-            db = get_db()
+
+            # 使用独立会话，避免在请求线程中关闭路由的scoped session导致用户实例分离
+            db = SessionLocal()
             try:
                 items = emby_data.get('Items', [])
                 logger.info(f"开始同步 {len(items)} 条观看记录到用户 {user_id}")
@@ -3857,62 +4117,103 @@ class EmbyAPI:
         return EmbyAPI.sync_user_watch_history(user_id, emby_user_id)
     
     @staticmethod
-    def sync_users():
-        """同步Emby用户到本地数据库"""
-        emby_users = EmbyAPI.get_users()
-        if not emby_users:
-            logger.warning("未能从Emby获取用户列表")
+    def sync_users(server_id=None):
+        """同步Emby用户到本地数据库
+
+        Args:
+            server_id: 指定媒体库ID；为None时同步所有已绑定的启用媒体库
+        """
+        if server_id is not None:
+            return EmbyAPI._sync_users_for_server(server_id)
+        # 同步所有媒体库
+        servers = EmbyAPI.get_all_servers(active_only=True)
+        if not servers:
+            # 旧版单库配置兜底
+            if EmbyAPI.is_configured():
+                return EmbyAPI._sync_users_for_server(None)
+            logger.warning("未绑定任何Emby媒体库，跳过用户同步")
             return False
-        
+        all_ok = True
+        total = 0
+        for srv in servers:
+            ok, cnt = EmbyAPI._sync_users_for_server(srv['id'])
+            all_ok = all_ok and ok
+            total += cnt
+        logger.info(f"全部媒体库同步完成，共 {total} 个用户")
+        return all_ok
+
+    @staticmethod
+    def _sync_users_for_server(server_id):
+        """同步指定媒体库的Emby用户到本地数据库，返回 (是否成功, 同步数量)"""
+        emby_users = EmbyAPI.get_users(server_id)
+        if not emby_users:
+            logger.warning(f"未能从Emby媒体库(ID={server_id})获取用户列表")
+            return False, 0
+
         db = get_db()
         synced_count = 0
         try:
-            for emby_user in emby_users:
-                emby_id = emby_user.get('Id')
-                emby_name = emby_user.get('Name')
-                
-                if not emby_id or not emby_name:
-                    continue
-                
-                # 跳过管理员账号
-                if emby_name.lower() == 'admin':
-                    continue
-                
-                # 查找本地用户
-                local_user = db.query(User).filter_by(emby_user_id=emby_id).first()
-                if not local_user:
-                    local_user = db.query(User).filter_by(username=emby_name).first()
-                    if local_user:
-                        local_user.emby_user_id = emby_id
-                        synced_count += 1
-                    else:
-                        new_user = User(
-                            username=emby_name,
-                            password_hash=generate_password_hash('123456'),
-                            role=UserRole.USER,
-                            is_active=True,
-                            expiry_date=None,
-                            emby_user_id=emby_id
-                        )
-                        db.add(new_user)
-                        db.flush()
-                        synced_count += 1
-                        db.commit()
-                        
-                        try:
-                            EmbyAPI.sync_user_watch_history(new_user.id, emby_id)
-                        except Exception as e:
-                            logger.error(f"同步用户 {emby_name} 的观看历史失败: {e}")
-                        
-                        db = get_db()
-            
+            with EmbyAPI.server_context(server_id):
+                for emby_user in emby_users:
+                    emby_id = emby_user.get('Id')
+                    emby_name = emby_user.get('Name')
+
+                    if not emby_id or not emby_name:
+                        continue
+
+                    # 跳过管理员账号
+                    if emby_name.lower() == 'admin':
+                        continue
+
+                    # 查找本地用户（优先按Emby ID）
+                    local_user = db.query(User).filter_by(emby_user_id=emby_id).first()
+                    if not local_user:
+                        # 同名且尚未归属其他媒体库的用户直接关联
+                        local_user = db.query(User).filter(
+                            User.username == emby_name,
+                            or_(User.emby_server_id.is_(None), User.emby_server_id == server_id)
+                        ).first()
+                        if local_user:
+                            local_user.emby_user_id = emby_id
+                            if local_user.emby_server_id is None:
+                                local_user.emby_server_id = server_id
+                            synced_count += 1
+                        else:
+                            # 同名用户已归属其他媒体库时无法再创建（用户名唯一），跳过
+                            existed = db.query(User).filter_by(username=emby_name).first()
+                            if existed:
+                                logger.info(f"用户 {emby_name} 已存在且属于其他媒体库，跳过创建")
+                                continue
+                            new_user = User(
+                                username=emby_name,
+                                password_hash=generate_password_hash('123456'),
+                                role=UserRole.USER,
+                                is_active=True,
+                                expiry_date=None,
+                                emby_user_id=emby_id,
+                                emby_server_id=server_id
+                            )
+                            db.add(new_user)
+                            db.flush()
+                            synced_count += 1
+                            db.commit()
+
+                            try:
+                                EmbyAPI.sync_user_watch_history(new_user.id, emby_id)
+                            except Exception as e:
+                                logger.error(f"同步用户 {emby_name} 的观看历史失败: {e}")
+
+                            db = get_db()
+                    elif local_user.emby_server_id is None:
+                        local_user.emby_server_id = server_id
+
             db.commit()
-            logger.info(f"成功同步 {synced_count} 个Emby用户")
-            return True
+            logger.info(f"媒体库(ID={server_id})成功同步 {synced_count} 个Emby用户")
+            return True, synced_count
         except Exception as e:
             db.rollback()
-            logger.error(f"同步用户失败: {e}")
-            return False
+            logger.error(f"同步媒体库(ID={server_id})用户失败: {e}")
+            return False, synced_count
         finally:
             db.close()
 
@@ -5188,16 +5489,23 @@ def api_change_password():
     
     # 第三步：同步到Emby（不影响本地密码修改结果）
     emby_sync_success = True
-    if emby_user_id and EmbyAPI.is_configured():
+    if emby_user_id:
+        _db = get_db()
         try:
-            emby_sync_success = EmbyAPI.update_password(emby_user_id, new_password)
-            if emby_sync_success:
-                logger.info(f"Emby密码同步成功: {username}")
-            else:
-                logger.warning(f"Emby密码同步失败: {username}")
-        except Exception as e:
-            logger.error(f"Emby密码同步异常: {e}")
-            emby_sync_success = False
+            _emby_sid = _db.query(User.emby_server_id).filter_by(id=user_id).scalar()
+        finally:
+            _db.close()
+        if EmbyAPI.is_configured(_emby_sid):
+            try:
+                with EmbyAPI.server_context(_emby_sid):
+                    emby_sync_success = EmbyAPI.update_password(emby_user_id, new_password)
+                if emby_sync_success:
+                    logger.info(f"Emby密码同步成功: {username}")
+                else:
+                    logger.warning(f"Emby密码同步失败: {username}")
+            except Exception as e:
+                logger.error(f"Emby密码同步异常: {e}")
+                emby_sync_success = False
 
     # 第四步：同步到 WebDAV（不影响本地密码修改结果）
     webdav_sync_success = True
@@ -5482,14 +5790,17 @@ def api_register():
         # 邮箱注册的用户（未激活）应该在Emby中被禁用
         emby_user_should_disabled = is_email_register  # 邮箱注册的用户默认禁用，直到激活
         emby_user_id = None
-        if EmbyAPI.is_configured():
-            emby_user_id = EmbyAPI.create_user(username, password, is_disabled=emby_user_should_disabled)
+        # 自助注册的用户归属第一个（默认）媒体库
+        _default_url, _default_key, emby_server_id = EmbyAPI._resolve_server()
+        if EmbyAPI.is_configured(emby_server_id):
+            with EmbyAPI.server_context(emby_server_id):
+                emby_user_id = EmbyAPI.create_user(username, password, is_disabled=emby_user_should_disabled)
             if not emby_user_id:
                 logger.warning(f"在Emby中创建用户失败: {username}")
                 # 继续创建本地用户，但记录警告
             else:
                 logger.info(f"在Emby中创建用户成功: {username}, ID: {emby_user_id}, is_disabled: {emby_user_should_disabled}")
-        
+
         # 创建用户
         # 邮箱注册的用户默认在Emby中被禁用，同步标记Emby访问已禁用
         user = User(
@@ -5499,6 +5810,7 @@ def api_register():
             is_active=True,
             expiry_date=expiry_date,
             emby_user_id=emby_user_id,
+            emby_server_id=emby_server_id if emby_user_id else None,
             email=email if is_email_register else None,
             email_verified=is_email_register,
             emby_access_disabled=emby_user_should_disabled
@@ -5590,9 +5902,11 @@ def api_admin_users_delete():
         for user_id in user_ids:
             user = db.query(User).get(user_id)
             if user and user.role != UserRole.ADMIN:
-                # 先删除Emby用户
-                if user.emby_user_id and EmbyAPI.is_configured():
-                    if EmbyAPI.delete_user(user.emby_user_id):
+                # 先删除Emby用户（按用户所属媒体库切换上下文）
+                if user.emby_user_id and EmbyAPI.is_configured(user.emby_server_id):
+                    with EmbyAPI.server_context(user.emby_server_id):
+                        delete_ok = EmbyAPI.delete_user(user.emby_user_id)
+                    if delete_ok:
                         emby_deleted_count += 1
                         logger.info(f"已删除Emby用户: {user.username}")
                     else:
@@ -5644,6 +5958,7 @@ def api_admin_users_add():
     password = data.get('password', '')
     email = data.get('email', '').strip() if data.get('email') else ''
     webdav_server_id = data.get('webdav_server_id')  # None表示自动分配
+    emby_server_id = data.get('emby_server_id')  # 指定归属的Emby媒体库
     remark = data.get('remark', '').strip() if data.get('remark') else ''
 
     # 验证必填字段
@@ -5669,14 +5984,24 @@ def api_admin_users_add():
         # 管理员添加的用户初始状态为过期（需要后续续期）
         expiry_date = datetime.now()
 
-        # 在Emby中创建用户（如果Emby已配置）
+        # 确定用户归属的Emby媒体库：前端指定 > 第一个启用媒体库
+        target_server_id = None
+        if emby_server_id:
+            if not db.query(EmbyServer).get(int(emby_server_id)):
+                return jsonify({'success': False, 'message': '指定的媒体库不存在'}), 400
+            target_server_id = int(emby_server_id)
+        else:
+            _, _, target_server_id = EmbyAPI._resolve_server()
+
+        # 在Emby中创建用户（如果媒体库已配置）
         emby_user_id = None
-        if EmbyAPI.is_configured():
-            emby_user_id = EmbyAPI.create_user(username, password, is_disabled=True)
+        if EmbyAPI.is_configured(target_server_id):
+            with EmbyAPI.server_context(target_server_id):
+                emby_user_id = EmbyAPI.create_user(username, password, is_disabled=True)
             if not emby_user_id:
                 logger.warning(f"在Emby中创建用户失败: {username}")
             else:
-                logger.info(f"在Emby中创建用户成功: {username}, ID: {emby_user_id}")
+                logger.info(f"在Emby中创建用户成功: {username}, ID: {emby_user_id}, 媒体库ID: {target_server_id}")
 
         # 创建用户
         user = User(
@@ -5686,6 +6011,7 @@ def api_admin_users_add():
             is_active=True,
             expiry_date=expiry_date,
             emby_user_id=emby_user_id,
+            emby_server_id=target_server_id if emby_user_id else None,
             email=email if email else None,
             email_verified=False,
             emby_access_disabled=True  # 初始状态禁用Emby访问
@@ -5760,8 +6086,10 @@ def api_admin_users_renew():
             # 注意：不修改is_active
 
             # 禁用Emby用户（但不禁用系统登录）
-            if user.emby_user_id and EmbyAPI.is_configured():
-                if EmbyAPI.disable_user(user.emby_user_id):
+            if user.emby_user_id and EmbyAPI.is_configured(user.emby_server_id):
+                with EmbyAPI.server_context(user.emby_server_id):
+                    disabled_ok = EmbyAPI.disable_user(user.emby_user_id)
+                if disabled_ok:
                     user.emby_access_disabled = True
 
             # 提交更改
@@ -5828,8 +6156,9 @@ def api_admin_users_renew():
         user.emby_access_disabled = False  # 用户已续期，清除Emby访问禁用标记
 
         # 启用Emby用户
-        if user.emby_user_id and EmbyAPI.is_configured():
-            EmbyAPI.enable_user(user.emby_user_id)
+        if user.emby_user_id and EmbyAPI.is_configured(user.emby_server_id):
+            with EmbyAPI.server_context(user.emby_server_id):
+                EmbyAPI.enable_user(user.emby_user_id)
 
         # 同步启用 WebDAV
         try:
@@ -5928,15 +6257,16 @@ def api_admin_users_toggle():
             raise
         
         # 同步Emby用户状态
-        if user.emby_user_id and EmbyAPI.is_configured():
-            # 只有在用户未过期时才启用Emby
-            if user.is_active and not user.is_expired():
-                user.emby_access_disabled = False  # 清除标记，允许正常访问
-                EmbyAPI.enable_user(user.emby_user_id)
-            else:
-                # 用户已过期或被禁用，禁用Emby访问
-                if EmbyAPI.disable_user(user.emby_user_id):
-                    user.emby_access_disabled = True  # 设置标记，避免调度器重复禁用
+        if user.emby_user_id and EmbyAPI.is_configured(user.emby_server_id):
+            with EmbyAPI.server_context(user.emby_server_id):
+                # 只有在用户未过期时才启用Emby
+                if user.is_active and not user.is_expired():
+                    user.emby_access_disabled = False  # 清除标记，允许正常访问
+                    EmbyAPI.enable_user(user.emby_user_id)
+                else:
+                    # 用户已过期或被禁用，禁用Emby访问
+                    if EmbyAPI.disable_user(user.emby_user_id):
+                        user.emby_access_disabled = True  # 设置标记，避免调度器重复禁用
 
         # 同步 WebDAV 用户状态
         try:
@@ -6049,47 +6379,45 @@ def api_admin_sync_all_history():
         
         for user in users:
             try:
-                # 先同步活跃播放会话
-                user_sessions = EmbyAPI.get_active_sessions()
-                if user_sessions:
-                    # 过滤出该用户的会话
-                    user_active = [s for s in user_sessions if s.get('UserId') == user.emby_user_id]
-                    for session in user_active:
-                        now_playing = session.get('NowPlayingItem', {})
-                        play_state = session.get('PlayState', {})
-                        
-                        item_name = now_playing.get('Name', '未知影片')
-                        position_ticks = play_state.get('PositionTicks', 0)
-                        duration_seconds = position_ticks // 10000000 if position_ticks > 0 else 0
-                        
-                        now = datetime.now()
-                        end_time = now
-                        start_time = now - timedelta(seconds=duration_seconds) if duration_seconds > 0 else now
-                        
-                        existing = db.query(WatchHistory).filter_by(
-                            user_id=user.id,
-                            item_name=item_name
-                        ).first()
-                        
-                        if existing:
-                            existing.item_name = item_name
-                            existing.start_time = start_time
-                            existing.end_time = end_time
-                            existing.duration = duration_seconds
-                            total_records += 1
-                        else:
-                            watch_record = WatchHistory(
+                with EmbyAPI.server_context(user.emby_server_id):
+                    # 先同步活跃播放会话
+                    user_sessions = EmbyAPI.get_active_sessions()
+                    if user_sessions:
+                        # 过滤出该用户的会话
+                        user_active = [s for s in user_sessions if s.get('user_id') == user.emby_user_id]
+                        for session in user_active:
+                            item_name = session.get('item_name') or '未知影片'
+                            position_ticks = session.get('position_ticks', 0) or 0
+                            duration_seconds = position_ticks // 10000000 if position_ticks > 0 else 0
+
+                            now = datetime.now()
+                            end_time = now
+                            start_time = now - timedelta(seconds=duration_seconds) if duration_seconds > 0 else now
+
+                            existing = db.query(WatchHistory).filter_by(
                                 user_id=user.id,
-                                item_name=item_name,
-                                start_time=start_time,
-                                end_time=end_time,
-                                duration=duration_seconds
-                            )
-                            db.add(watch_record)
-                            total_records += 1
-                
-                # 同步历史观看记录
-                success = EmbyAPI.sync_user_watch_history_improved(user.id, user.emby_user_id)
+                                item_name=item_name
+                            ).first()
+
+                            if existing:
+                                existing.item_name = item_name
+                                existing.start_time = start_time
+                                existing.end_time = end_time
+                                existing.duration = duration_seconds
+                                total_records += 1
+                            else:
+                                watch_record = WatchHistory(
+                                    user_id=user.id,
+                                    item_name=item_name,
+                                    start_time=start_time,
+                                    end_time=end_time,
+                                    duration=duration_seconds
+                                )
+                                db.add(watch_record)
+                                total_records += 1
+
+                    # 同步历史观看记录
+                    success = EmbyAPI.sync_user_watch_history_improved(user.id, user.emby_user_id)
                 if success:
                     synced_count += 1
                 else:
@@ -6127,13 +6455,14 @@ def api_admin_user_history(user_id):
         
         # 优先从Emby获取最新的观看历史
         emby_history_items = []
-        if user.emby_user_id and EmbyAPI.is_configured():
+        if user.emby_user_id and EmbyAPI.is_configured(user.emby_server_id):
             try:
-                emby_data = EmbyAPI.get_user_watch_history(user.emby_user_id)
-                if emby_data and 'Items' in emby_data:
-                    emby_history_items = emby_data['Items']
-                    # 同步到本地数据库
-                    EmbyAPI.sync_user_watch_history(user.id, user.emby_user_id)
+                with EmbyAPI.server_context(user.emby_server_id):
+                    emby_data = EmbyAPI.get_user_watch_history(user.emby_user_id)
+                    if emby_data and 'Items' in emby_data:
+                        emby_history_items = emby_data['Items']
+                        # 同步到本地数据库
+                        EmbyAPI.sync_user_watch_history(user.id, user.emby_user_id)
             except Exception as e:
                 logger.error(f"从Emby获取用户 {user_id} 观看历史失败: {e}")
         
@@ -6189,22 +6518,30 @@ def api_admin_user_sync_to_emby(user_id):
         if not user:
             return jsonify({'success': False, 'message': '用户不存在'}), 404
         
-        if not EmbyAPI.is_configured():
+        if not EmbyAPI.is_configured(user.emby_server_id):
             return jsonify({'success': False, 'message': 'Emby服务器未配置'}), 400
-        
+
         if user.emby_user_id:
             return jsonify({'success': False, 'message': '用户已同步到Emby'}), 400
-        
-        # 在Emby中创建用户
+
+        # 在用户所属（或默认）媒体库中创建用户
         # 使用默认密码 '123456'，用户需要通过Emby修改密码
-        emby_user_id = EmbyAPI.create_user(user.username, '123456')
-        
+        with EmbyAPI.server_context(user.emby_server_id):
+            emby_user_id = EmbyAPI.create_user(user.username, '123456')
+
         if not emby_user_id:
             return jsonify({'success': False, 'message': '在Emby中创建用户失败'}), 500
-        
+
+        # 记录用户归属媒体库（上下文中实际使用的库）
+        _, _, resolved_sid = EmbyAPI._resolve_server(user.emby_server_id)
+        if user.emby_server_id is None:
+            user.emby_server_id = resolved_sid
+
         # 如果用户已过期或禁用，同步禁用状态
         if not user.is_active or user.is_expired():
-            if EmbyAPI.disable_user(emby_user_id):
+            with EmbyAPI.server_context(user.emby_server_id):
+                disabled_ok = EmbyAPI.disable_user(emby_user_id)
+            if disabled_ok:
                 user.emby_access_disabled = True  # 设置标记，避免调度器重复禁用
         else:
             user.emby_access_disabled = False  # 用户正常，清除禁用标记
@@ -6362,107 +6699,348 @@ def api_admin_codes_delete():
 @app.route('/api/admin/emby/test', methods=['POST'])
 @admin_required
 def api_admin_emby_test():
-    """测试Emby连接"""
+    """测试Emby连接（兼容旧版：直接传入 server_url / api_key）
+    编辑已绑定媒体库时可额外传 server_id，api_key 传 *** 或留空表示使用已保存的密钥"""
     data = request.get_json()
     server_url = data.get('server_url', '').strip()
     api_key = data.get('api_key', '').strip()
-    
+    server_id = data.get('server_id')
+
+    # 编辑模式下密钥保持 *** / 留空时，回退使用该媒体库已保存的密钥
+    if server_id and (not api_key or api_key == '***'):
+        db = get_db()
+        try:
+            try:
+                srv = db.query(EmbyServer).get(int(server_id))
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'message': '媒体库ID无效'}), 400
+            if not srv:
+                return jsonify({'success': False, 'message': '媒体库不存在'}), 404
+            api_key = srv.api_key
+            if not server_url:
+                server_url = srv.server_url
+        finally:
+            db.close()
+
     if not server_url or not api_key:
         return jsonify({'success': False, 'message': '请填写完整信息'}), 400
-    
-    # 确保URL格式正确
-    if server_url.endswith('/'):
-        server_url = server_url[:-1]
-    
+
+    ok, version, info = EmbyAPI.test_server_connection(server_url, api_key)
+    if ok:
+        return jsonify({'success': True, 'message': '连接成功', 'data': {'Version': version, 'ServerName': info}})
+    return jsonify({'success': False, 'message': info}), 400
+
+# ============== 多Emby媒体库管理 ==============
+
+def _normalize_addresses(raw):
+    """规范化前端提交的用户访问地址列表"""
+    if not isinstance(raw, list):
+        return []
+    result = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        url = (item.get('url') or '').strip().rstrip('/')
+        host = (item.get('host') or '').strip()
+        port = str(item.get('port') or '').strip()
+        label = (item.get('label') or '').strip()
+        if not url and not host:
+            continue
+        if not url and host:
+            url = host.rstrip('/')
+            if port:
+                url = f"{url}:{port}"
+            if not url.startswith('http'):
+                url = f"http://{url}"
+        result.append({'label': label, 'host': host, 'port': port, 'url': url})
+    return result
+
+@app.route('/api/admin/emby/servers', methods=['GET'])
+@admin_required
+def api_admin_emby_servers():
+    """获取所有已绑定的Emby媒体库（含连接状态/版本/同步用户数）"""
+    db = get_db()
     try:
-        headers = {'X-Emby-Token': api_key}
-        test_url = f"{server_url}/emby/System/Info"
-        response = requests.get(test_url, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            return jsonify({
-                'success': True,
-                'message': '连接成功',
-                'data': response.json()
-            })
-        elif response.status_code == 401:
-            return jsonify({'success': False, 'message': 'API密钥无效，请检查密钥是否正确'}), 400
-        else:
-            return jsonify({'success': False, 'message': f'连接失败，HTTP状态码: {response.status_code}'}), 400
-    except requests.exceptions.Timeout:
-        return jsonify({'success': False, 'message': '连接超时，请检查服务器地址是否正确'}), 400
-    except requests.exceptions.ConnectionError:
-        return jsonify({'success': False, 'message': '无法连接到服务器，请检查地址和端口'}), 400
+        servers = db.query(EmbyServer).order_by(EmbyServer.id.asc()).all()
+        result = []
+        for srv in servers:
+            user_count = db.query(User).filter(
+                User.emby_server_id == srv.id,
+                User.role == UserRole.USER
+            ).count()
+            item = srv.to_dict(include_key=True, user_count=user_count)
+            result.append(item)
+        return jsonify({'success': True, 'data': result})
+    finally:
+        db.close()
+
+@app.route('/api/admin/emby/servers', methods=['POST'])
+@admin_required
+def api_admin_emby_server_create():
+    """绑定新的Emby媒体库"""
+    data = request.get_json() or {}
+    name = (data.get('name') or '').strip()
+    server_url = (data.get('server_url') or '').strip().rstrip('/')
+    api_key = (data.get('api_key') or '').strip()
+    addresses = _normalize_addresses(data.get('addresses'))
+
+    if not name:
+        return jsonify({'success': False, 'message': '请填写媒体库名称'}), 400
+    if not server_url or not api_key:
+        return jsonify({'success': False, 'message': '请填写服务器地址和API密钥'}), 400
+
+    ok, version, info = EmbyAPI.test_server_connection(server_url, api_key)
+    if not ok:
+        return jsonify({'success': False, 'message': f'绑定失败：{info}'}), 400
+
+    db = get_db()
+    try:
+        srv = EmbyServer(
+            name=name,
+            server_url=server_url,
+            api_key=api_key,
+            addresses=json.dumps(addresses, ensure_ascii=False),
+            is_active=True,
+            last_status='ok',
+            server_version=version,
+            last_tested_at=datetime.now()
+        )
+        db.add(srv)
+        db.flush()
+        server_id = srv.id
+
+        # 兼容旧版：首个媒体库同步到全局配置，保证未改造的兜底逻辑可用
+        count_all = db.query(EmbyServer).count()
+        if count_all == 1:
+            set_config('emby_server_url', server_url)
+            set_config('emby_api_key', api_key)
+
+        db.commit()
     except Exception as e:
-        logger.error(f"测试Emby连接失败: {e}")
-        return jsonify({'success': False, 'message': f'连接失败: {str(e)}'}), 400
+        db.rollback()
+        logger.error(f"绑定Emby媒体库失败: {e}")
+        return jsonify({'success': False, 'message': f'绑定失败: {str(e)}'}), 500
+    finally:
+        db.close()
+
+    # 同步该媒体库用户
+    try:
+        EmbyAPI.sync_users(server_id)
+    except Exception as e:
+        logger.error(f"绑定后同步用户失败: {e}")
+
+    logger.info(f"Emby媒体库绑定成功: {name} ({server_url})")
+    return jsonify({'success': True, 'message': '媒体库绑定成功', 'data': {'id': server_id, 'version': version}})
+
+@app.route('/api/admin/emby/servers/<int:server_id>', methods=['PUT'])
+@admin_required
+def api_admin_emby_server_update(server_id):
+    """编辑已绑定的Emby媒体库"""
+    data = request.get_json() or {}
+    db = get_db()
+    try:
+        srv = db.query(EmbyServer).get(server_id)
+        if not srv:
+            return jsonify({'success': False, 'message': '媒体库不存在'}), 404
+
+        name = (data.get('name') or '').strip()
+        server_url = (data.get('server_url') or '').strip().rstrip('/')
+        api_key = (data.get('api_key') or '').strip()
+        if 'addresses' in data:
+            addresses = _normalize_addresses(data.get('addresses'))
+            srv.addresses = json.dumps(addresses, ensure_ascii=False)
+        if 'is_active' in data:
+            srv.is_active = bool(data.get('is_active'))
+
+        if not name or not server_url:
+            return jsonify({'success': False, 'message': '名称和服务器地址不能为空'}), 400
+        # 前端未修改密钥时回传 ***
+        if not api_key or api_key == '***':
+            api_key = srv.api_key
+
+        # 测试新连接配置
+        ok, version, info = EmbyAPI.test_server_connection(server_url, api_key)
+        if not ok:
+            return jsonify({'success': False, 'message': f'保存失败：{info}'}), 400
+
+        srv.name = name
+        srv.server_url = server_url
+        srv.api_key = api_key
+        srv.last_status = 'ok'
+        srv.server_version = version
+        srv.last_tested_at = datetime.now()
+
+        # 首个媒体库时同步旧版全局配置
+        first = db.query(EmbyServer).order_by(EmbyServer.id.asc()).first()
+        if first and first.id == server_id:
+            set_config('emby_server_url', server_url)
+            set_config('emby_api_key', api_key)
+
+        db.commit()
+        return jsonify({'success': True, 'message': '媒体库已更新'})
+    except Exception as e:
+        db.rollback()
+        logger.error(f"更新Emby媒体库失败: {e}")
+        return jsonify({'success': False, 'message': f'更新失败: {str(e)}'}), 500
+    finally:
+        db.close()
+
+@app.route('/api/admin/emby/servers/<int:server_id>/test', methods=['POST'])
+@admin_required
+def api_admin_emby_server_test(server_id):
+    """测试指定媒体库连接并缓存结果"""
+    db = get_db()
+    try:
+        srv = db.query(EmbyServer).get(server_id)
+        if not srv:
+            return jsonify({'success': False, 'message': '媒体库不存在'}), 404
+        ok, version, info = EmbyAPI.test_server_connection(srv.server_url, srv.api_key)
+        srv.last_status = 'ok' if ok else 'fail'
+        srv.last_tested_at = datetime.now()
+        if ok and version:
+            srv.server_version = version
+        db.commit()
+        if ok:
+            return jsonify({'success': True, 'message': '连接成功', 'data': {'version': version}})
+        return jsonify({'success': False, 'message': info}), 400
+    finally:
+        db.close()
+
+@app.route('/api/admin/emby/servers/<int:server_id>/sync', methods=['POST'])
+@admin_required
+def api_admin_emby_server_sync(server_id):
+    """同步指定媒体库的用户"""
+    db = get_db()
+    try:
+        srv = db.query(EmbyServer).get(server_id)
+        if not srv:
+            return jsonify({'success': False, 'message': '媒体库不存在'}), 404
+    finally:
+        db.close()
+    result = EmbyAPI._sync_users_for_server(server_id)
+    ok, cnt = result[0], result[1]
+    if not ok:
+        return jsonify({'success': False, 'message': '同步失败，请检查媒体库连接'}), 500
+    db = get_db()
+    try:
+        user_count = db.query(User).filter(
+            User.emby_server_id == server_id,
+            User.role == UserRole.USER
+        ).count()
+        return jsonify({'success': True, 'message': f'已同步 {user_count} 个用户',
+                        'data': {'user_count': user_count}})
+    finally:
+        db.close()
+
+@app.route('/api/admin/emby/servers/<int:server_id>', methods=['DELETE'])
+@admin_required
+def api_admin_emby_server_delete(server_id):
+    """解绑指定媒体库：仅删除归属该媒体库的本地用户数据"""
+    data = request.get_json(silent=True) or {}
+    confirm = data.get('confirm', False)
+    if not confirm:
+        return jsonify({'success': False, 'message': '请确认解绑操作'}), 400
+
+    db = get_db()
+    try:
+        srv = db.query(EmbyServer).get(server_id)
+        if not srv:
+            return jsonify({'success': False, 'message': '媒体库不存在'}), 404
+
+        users_to_delete = db.query(User).filter(
+            User.emby_server_id == server_id,
+            User.role == UserRole.USER
+        ).all()
+        deleted_user_count = len(users_to_delete)
+        deleted_ids = [u.id for u in users_to_delete]
+        for user in users_to_delete:
+            db.delete(user)
+
+        watch_history_deleted = 0
+        login_logs_deleted = 0
+        if deleted_ids:
+            watch_history_deleted = db.query(WatchHistory).filter(WatchHistory.user_id.in_(deleted_ids)).delete(synchronize_session=False)
+            login_logs_deleted = db.query(LoginLog).filter(LoginLog.user_id.in_(deleted_ids)).delete(synchronize_session=False)
+
+        was_first = db.query(EmbyServer).order_by(EmbyServer.id.asc()).first()
+        was_first_id = was_first.id if was_first else None
+        db.delete(srv)
+        db.flush()
+
+        # 若删除的是首个媒体库，把旧版全局配置指向新的首个媒体库
+        new_first = db.query(EmbyServer).order_by(EmbyServer.id.asc()).first()
+        if new_first:
+            set_config('emby_server_url', new_first.server_url)
+            set_config('emby_api_key', new_first.api_key)
+        elif was_first_id == server_id:
+            set_config('emby_server_url', '')
+            set_config('emby_api_key', '')
+
+        db.commit()
+        logger.info(f"Emby媒体库(ID={server_id})已解绑，删除用户 {deleted_user_count} 个，观看记录 {watch_history_deleted} 条")
+        return jsonify({
+            'success': True,
+            'message': f'解绑成功！已删除该媒体库下 {deleted_user_count} 个用户、{watch_history_deleted} 条观看记录',
+            'data': {
+                'deleted_users': deleted_user_count,
+                'deleted_watch_history': watch_history_deleted
+            }
+        })
+    except Exception as e:
+        db.rollback()
+        logger.error(f"解绑Emby媒体库失败: {e}")
+        return jsonify({'success': False, 'message': f'解绑失败: {str(e)}'}), 500
+    finally:
+        db.close()
 
 @app.route('/api/admin/emby/bind', methods=['POST'])
 @admin_required
 def api_admin_emby_bind():
-    data = request.get_json()
-    server_url = data.get('server_url', '').strip()
-    api_key = data.get('api_key', '').strip()
-    
-    if not server_url or not api_key:
-        return jsonify({'success': False, 'message': '请填写完整信息'}), 400
-    
-    # 确保URL格式正确
-    if server_url.endswith('/'):
-        server_url = server_url[:-1]
-    
-    # 测试连接
-    try:
-        headers = {'X-Emby-Token': api_key}
-        test_url = f"{server_url}/emby/System/Info"
-        response = requests.get(test_url, headers=headers, timeout=10)
-        
-        if response.status_code != 200:
-            return jsonify({'success': False, 'message': '连接失败，请检查配置'}), 400
-        
-        # 保存配置
-        set_config('emby_server_url', server_url)
-        set_config('emby_api_key', api_key)
-        
-        # 同步用户
-        EmbyAPI.sync_users()
-        
-        logger.info("Emby服务器绑定成功")
-        
-        return jsonify({
-            'success': True,
-            'message': '绑定成功',
-            'data': response.json()
-        })
-    except Exception as e:
-        logger.error(f"绑定Emby失败: {e}")
-        return jsonify({'success': False, 'message': f'连接失败: {str(e)}'}), 400
+    """旧版绑定接口（兼容保留）：等价于新建一个媒体库"""
+    data = request.get_json() or {}
+    data.setdefault('name', '默认媒体库')
+    return api_admin_emby_server_create()
 
 @app.route('/api/admin/emby/config', methods=['GET'])
 @admin_required
 def api_admin_emby_config():
-    return jsonify({
-        'success': True,
-        'data': {
-            'server_url': get_config('emby_server_url', ''),
-            'api_key': '***' if get_config('emby_api_key') else ''
-        }
-    })
+    """旧版配置接口（兼容保留）：返回首个媒体库信息及媒体库列表"""
+    db = get_db()
+    try:
+        first = db.query(EmbyServer).order_by(EmbyServer.id.asc()).first()
+        servers = [s.to_dict(include_key=True) for s in db.query(EmbyServer).order_by(EmbyServer.id.asc()).all()]
+        return jsonify({
+            'success': True,
+            'data': {
+                'server_url': first.server_url if first else get_config('emby_server_url', ''),
+                'api_key': '***' if (first.api_key if first else get_config('emby_api_key')) else '',
+                'servers': servers
+            }
+        })
+    finally:
+        db.close()
 
 @app.route('/api/admin/emby/sync-users', methods=['POST'])
 @admin_required
 def api_admin_emby_sync_users():
-    """手动同步Emby用户"""
-    if not EmbyAPI.is_configured():
-        return jsonify({'success': False, 'message': 'Emby服务器未配置'}), 400
-    
+    """手动同步Emby用户（可指定 server_id，否则同步全部媒体库）"""
+    data = request.get_json(silent=True) or {}
+    server_id = data.get('server_id')
+    if server_id is not None:
+        result = EmbyAPI._sync_users_for_server(int(server_id))
+        ok = result[0]
+    else:
+        if not EmbyAPI.get_all_servers() and not EmbyAPI.is_configured():
+            return jsonify({'success': False, 'message': 'Emby服务器未配置'}), 400
+        ok = EmbyAPI.sync_users()
     try:
-        result = EmbyAPI.sync_users()
-        if result:
-            # 获取同步后的用户数量
+        if ok:
             db = get_db()
             try:
-                user_count = db.query(User).filter(User.role == UserRole.USER).count()
+                q = db.query(User).filter(User.role == UserRole.USER)
+                if server_id is not None:
+                    q = q.filter(User.emby_server_id == int(server_id))
+                user_count = q.count()
                 return jsonify({
                     'success': True,
                     'message': f'已同步 {user_count} 个用户',
@@ -6470,8 +7048,7 @@ def api_admin_emby_sync_users():
                 })
             finally:
                 db.close()
-        else:
-            return jsonify({'success': False, 'message': '同步失败，请检查Emby服务器连接'}), 500
+        return jsonify({'success': False, 'message': '同步失败，请检查Emby服务器连接'}), 500
     except Exception as e:
         logger.error(f"手动同步用户失败: {e}")
         return jsonify({'success': False, 'message': f'同步失败: {str(e)}'}), 500
@@ -6479,38 +7056,37 @@ def api_admin_emby_sync_users():
 @app.route('/api/admin/emby/unbind', methods=['POST'])
 @admin_required
 def api_admin_emby_unbind():
-    """解绑Emby媒体库并清空所有用户数据"""
-    data = request.get_json()
+    """旧版解绑接口（兼容保留）：传入 server_id 时只解绑该库，否则清空全部"""
+    data = request.get_json() or {}
     confirm = data.get('confirm', False)
-    
+    server_id = data.get('server_id')
+
     if not confirm:
         return jsonify({'success': False, 'message': '请确认解绑操作'}), 400
-    
+
+    if server_id is not None:
+        return api_admin_emby_server_delete(int(server_id))
+
     db = get_db()
     try:
-        # 1. 清除Emby配置
-        set_config('emby_server_url', '')
-        set_config('emby_api_key', '')
-        
-        # 2. 删除所有普通用户（保留管理员）
+        # 清空全部媒体库与全部普通用户数据
+        db.query(EmbyServer).delete()
+
         users_to_delete = db.query(User).filter(User.role == UserRole.USER).all()
         deleted_user_count = len(users_to_delete)
         for user in users_to_delete:
             db.delete(user)
-        
-        # 3. 删除所有观看历史记录
+
         try:
             watch_history_deleted = db.query(WatchHistory).delete()
         except:
             watch_history_deleted = 0
-        
-        # 4. 删除所有激活码
+
         try:
             activation_codes_deleted = db.query(ActivationCode).delete()
         except:
             activation_codes_deleted = 0
-        
-        # 5. 删除所有登录日志（保留管理员的）
+
         try:
             admin_users = db.query(User).filter(User.role == UserRole.ADMIN).all()
             admin_ids = [u.id for u in admin_users]
@@ -6520,11 +7096,12 @@ def api_admin_emby_unbind():
                 login_logs_deleted = db.query(LoginLog).delete()
         except:
             login_logs_deleted = 0
-        
+
+        set_config('emby_server_url', '')
+        set_config('emby_api_key', '')
+
         db.commit()
-        
-        logger.info(f"Emby媒体库已解绑，删除了 {deleted_user_count} 个用户, {watch_history_deleted} 条观看记录, {activation_codes_deleted} 个激活码")
-        
+        logger.info(f"全部Emby媒体库已解绑，删除了 {deleted_user_count} 个用户")
         return jsonify({
             'success': True,
             'message': f'解绑成功！已清空 {deleted_user_count} 个用户、{watch_history_deleted} 条观看记录、{activation_codes_deleted} 个激活码',
@@ -7295,6 +7872,30 @@ def api_admin_stats():
             growth_labels.append(date.strftime('%m-%d'))
             growth_data.append(count)
 
+        # 各Emby媒体库统计
+        emby_servers = db.query(EmbyServer).order_by(EmbyServer.id.asc()).all()
+        servers_stats = []
+        for srv in emby_servers:
+            srv_users = db.query(User).filter(
+                User.emby_server_id == srv.id,
+                User.role == UserRole.USER
+            )
+            srv_total = srv_users.count()
+            srv_active = srv_users.filter_by(is_active=True).count()
+            srv_expired = srv_users.filter(
+                and_(User.expiry_date != None, User.expiry_date < datetime.now())
+            ).count()
+            servers_stats.append({
+                'id': srv.id,
+                'name': srv.name,
+                'server_url': srv.server_url,
+                'last_status': srv.last_status,
+                'server_version': srv.server_version,
+                'user_total': srv_total,
+                'user_active': srv_active,
+                'user_expired': srv_expired
+            })
+
         return jsonify({
             'success': True,
             'data': {
@@ -7310,7 +7911,8 @@ def api_admin_stats():
                     'used': used_codes,
                     'unused': unused_codes
                 },
-                'emby_connected': EmbyAPI.is_configured(),
+                'emby_connected': bool(emby_servers) or EmbyAPI.is_configured(),
+                'servers': servers_stats,
                 'growth': {
                     'labels': growth_labels,
                     'data': growth_data
@@ -7404,92 +8006,80 @@ def api_user_mark_coin_notifications_read():
 @login_required
 def api_user_sync_history():
     """刷新自己的观看记录（包括活跃播放会话和历史记录）"""
-    if not EmbyAPI.is_configured():
-        return jsonify({'success': False, 'message': 'Emby未配置，无法同步'}), 400
-    
     db = get_db()
     try:
         user = db.query(User).get(session['user_id'])
-        
+
         # 检查用户是否过期
         if user.is_expired():
             return jsonify({'success': False, 'message': '更新失败了QAQ 你的套餐已过期，请立即续费！'}), 403
-        
+
         if not user.emby_user_id:
             return jsonify({'success': False, 'message': '未绑定Emby账户，无法同步'}), 400
-        
+
+        if not EmbyAPI.is_configured(user.emby_server_id):
+            return jsonify({'success': False, 'message': 'Emby媒体库未配置，无法同步'}), 400
+
         total_records = 0
-        
-        # 先同步活跃播放会话（正在播放的内容）
-        try:
-            user_sessions = EmbyAPI.get_active_sessions()
-            logger.info(f"当前用户Emby ID: {user.emby_user_id}, 用户名: {user.username}")
-            if user_sessions:
-                # 过滤出该用户的会话
-                user_active = [s for s in user_sessions if s.get('UserId') == user.emby_user_id]
-                logger.info(f"过滤后该用户的活跃会话: {len(user_active)} 个")
-                for user_session in user_active:
-                    now_playing = user_session.get('NowPlayingItem', {})
-                    play_state = user_session.get('PlayState', {})
-                    
-                    # 构建完整的影片名称（包含系列名称）
-                    series_name = now_playing.get('SeriesName', '')
-                    season_name = now_playing.get('SeasonName', '')
-                    episode_name = now_playing.get('Name', '未知影片')
-                    item_type = now_playing.get('Type', '')
-                    
-                    if series_name and item_type == 'Episode':
-                        if season_name:
-                            item_name = f"{series_name} - {season_name} - {episode_name}"
+
+        with EmbyAPI.server_context(user.emby_server_id):
+            # 先同步活跃播放会话（正在播放的内容）
+            try:
+                user_sessions = EmbyAPI.get_active_sessions()
+                logger.info(f"当前用户Emby ID: {user.emby_user_id}, 用户名: {user.username}")
+                if user_sessions:
+                    # 过滤出该用户的会话
+                    user_active = [s for s in user_sessions if s.get('user_id') == user.emby_user_id]
+                    logger.info(f"过滤后该用户的活跃会话: {len(user_active)} 个")
+                    for user_session in user_active:
+                        # 构建完整的影片名称（包含系列名称）
+                        series_name = user_session.get('series_name', '') or ''
+                        season_name = user_session.get('season_name', '') or ''
+                        episode_name = user_session.get('item_name', '未知影片')
+                        item_type = user_session.get('item_type', '')
+
+                        if series_name and item_type == 'Episode':
+                            if season_name:
+                                item_name = f"{series_name} - {season_name} - {episode_name}"
+                            else:
+                                item_name = f"{series_name} - {episode_name}"
                         else:
-                            item_name = f"{series_name} - {episode_name}"
-                    else:
-                        item_name = episode_name
-                    
-                    position_ticks = play_state.get('PositionTicks', 0)
-                    duration_seconds = position_ticks // 10000000 if position_ticks > 0 else 0
-                    
-                    # 尝试获取会话的实际开始时间
-                    session_info = user_session.get('SessionInfo', {})
-                    last_activity = user_session.get('LastActivityDate') or session_info.get('LastActivityDate')
-                    
-                    if last_activity:
-                        try:
-                            end_time = datetime.fromisoformat(last_activity.replace('Z', '+00:00')).replace(tzinfo=None)
-                        except:
-                            end_time = datetime.now()
-                    else:
+                            item_name = episode_name
+
+                        position_ticks = user_session.get('position_ticks', 0) or 0
+                        duration_seconds = position_ticks // 10000000 if position_ticks > 0 else 0
+
                         end_time = datetime.now()
-                    
-                    # 开始时间 = 结束时间 - 播放时长
-                    start_time = end_time - timedelta(seconds=duration_seconds) if duration_seconds > 0 else end_time
-                    
-                    existing = db.query(WatchHistory).filter_by(
-                        user_id=user.id,
-                        item_name=item_name
-                    ).first()
-                    
-                    if existing:
-                        existing.item_name = item_name
-                        existing.start_time = start_time
-                        existing.end_time = end_time
-                        existing.duration = duration_seconds
-                        total_records += 1
-                    else:
-                        watch_record = WatchHistory(
+
+                        # 开始时间 = 结束时间 - 播放时长
+                        start_time = end_time - timedelta(seconds=duration_seconds) if duration_seconds > 0 else end_time
+
+                        existing = db.query(WatchHistory).filter_by(
                             user_id=user.id,
-                            item_name=item_name,
-                            start_time=start_time,
-                            end_time=end_time,
-                            duration=duration_seconds
-                        )
-                        db.add(watch_record)
-                        total_records += 1
-        except Exception as e:
-            logger.error(f"同步活跃播放会话失败: {e}")
-        
-        # 同步历史观看记录
-        success = EmbyAPI.sync_user_watch_history_improved(user.id, user.emby_user_id)
+                            item_name=item_name
+                        ).first()
+
+                        if existing:
+                            existing.item_name = item_name
+                            existing.start_time = start_time
+                            existing.end_time = end_time
+                            existing.duration = duration_seconds
+                            total_records += 1
+                        else:
+                            watch_record = WatchHistory(
+                                user_id=user.id,
+                                item_name=item_name,
+                                start_time=start_time,
+                                end_time=end_time,
+                                duration=duration_seconds
+                            )
+                            db.add(watch_record)
+                            total_records += 1
+            except Exception as e:
+                logger.error(f"同步活跃播放会话失败: {e}")
+
+            # 同步历史观看记录
+            success = EmbyAPI.sync_user_watch_history_improved(user.id, user.emby_user_id)
         
         db.commit()
         
@@ -7520,8 +8110,9 @@ def api_user_history():
         history = db.query(WatchHistory).filter_by(user_id=user.id).order_by(WatchHistory.created_at.desc()).all()
         
         # 尝试从Emby获取
-        if user.emby_user_id and EmbyAPI.is_configured():
-            emby_history = EmbyAPI.get_user_watch_history(user.emby_user_id)
+        if user.emby_user_id and EmbyAPI.is_configured(user.emby_server_id):
+            with EmbyAPI.server_context(user.emby_server_id):
+                emby_history = EmbyAPI.get_user_watch_history(user.emby_user_id)
             if emby_history and 'Items' in emby_history:
                 emby_items = []
                 for item in emby_history.get('Items', []):
@@ -7542,6 +8133,262 @@ def api_user_history():
             'success': True,
             'data': [h.to_dict() for h in history]
         })
+    finally:
+        db.close()
+
+# ============== 看剧日历 ==============
+
+@app.route('/api/user/watch-calendar', methods=['GET'])
+@login_required
+def api_user_watch_calendar():
+    """看剧日历：返回近一年（含当月共12个月）内有观看记录的日期及当天记录条数"""
+    db = get_db()
+    try:
+        user = db.query(User).get(session['user_id'])
+        # 看剧日历仅激活有效期内的用户可查看
+        if not user.is_active:
+            return jsonify({'success': False, 'message': '账号已被禁用'}), 403
+        if user.is_expired():
+            return jsonify({'success': False, 'message': '账号已过期，请先续期'}), 403
+        today = datetime.now().date()
+
+        # 12个月窗口起点：11个月前的1号
+        start_year = today.year
+        start_month = today.month - 11
+        while start_month <= 0:
+            start_month += 12
+            start_year -= 1
+        start_date = datetime(start_year, start_month, 1)
+        # 截止：明天0点（含今天全部）
+        end_date = datetime.combine(today + timedelta(days=1), datetime.min.time())
+
+        rows = db.query(WatchHistory.start_time).filter(
+            WatchHistory.user_id == user.id,
+            WatchHistory.start_time.isnot(None),
+            WatchHistory.start_time >= start_date,
+            WatchHistory.start_time < end_date
+        ).all()
+
+        days = {}
+        for (st,) in rows:
+            d = st.date()
+            if start_date.date() <= d <= today:
+                key = d.isoformat()
+                days[key] = days.get(key, 0) + 1
+
+        return jsonify({'success': True, 'data': {
+            'today': today.isoformat(),
+            'min_month': f'{start_year:04d}-{start_month:02d}',
+            'max_month': today.strftime('%Y-%m'),
+            'days': days
+        }})
+    finally:
+        db.close()
+
+@app.route('/api/user/watch-calendar/day', methods=['GET'])
+@login_required
+def api_user_watch_calendar_day():
+    """看剧日历-某日详情：按影视剧聚合成时间线，含海报（Primary）、年份、简介/剧集信息"""
+    date_str = (request.args.get('date') or '').strip()
+    try:
+        day = datetime.strptime(date_str, '%Y-%m-%d').date()
+    except ValueError:
+        return jsonify({'success': False, 'message': '日期格式错误'}), 400
+
+    db = get_db()
+    try:
+        user = db.query(User).get(session['user_id'])
+        # 看剧日历仅激活有效期内的用户可查看
+        if not user.is_active:
+            return jsonify({'success': False, 'message': '账号已被禁用'}), 403
+        if user.is_expired():
+            return jsonify({'success': False, 'message': '账号已过期，请先续期'}), 403
+        today = datetime.now().date()
+        if day > today:
+            return jsonify({'success': False, 'message': '这一天还没有到来哦~'}), 400
+
+        day_start = datetime.combine(day, datetime.min.time())
+        day_end = day_start + timedelta(days=1)
+        records = db.query(WatchHistory).filter(
+            WatchHistory.user_id == user.id,
+            WatchHistory.start_time.isnot(None),
+            WatchHistory.start_time >= day_start,
+            WatchHistory.start_time < day_end
+        ).order_by(WatchHistory.start_time.asc()).all()
+
+        if not records:
+            return jsonify({'success': True, 'data': {'date': day.isoformat(), 'groups': []}})
+
+        # 从 Emby 拉取条目详情（剧集归属、海报、年份、简介）
+        details = {}
+        series_details = {}
+        server_url = None
+        api_key = None
+        try:
+            if user.emby_user_id and EmbyAPI.is_configured(user.emby_server_id):
+                with EmbyAPI.server_context(user.emby_server_id):
+                    server_url = EmbyAPI.get_server_url(user.emby_server_id).rstrip('/')
+                    api_key = EmbyAPI.get_api_key(user.emby_server_id)
+
+                    # 显式请求 ProductionYear/PremiereDate：该服务器不主动返回年份字段
+                    def _cal_fetch_items(item_ids):
+                        result = {}
+                        for j in range(0, len(item_ids), 50):
+                            try:
+                                resp = requests.get(
+                                    f"{server_url}/emby/Items",
+                                    params={
+                                        'api_key': api_key,
+                                        'Ids': ','.join(str(x) for x in item_ids[j:j + 50]),
+                                        'Fields': 'SeriesName,SeasonName,ParentId,SeriesId,Overview,'
+                                                  'ImageTags,BackdropImageTags,PrimaryImageTag,'
+                                                  'ProductionYear,PremiereDate'
+                                    },
+                                    headers={'Accept': 'application/json'},
+                                    timeout=15
+                                )
+                                if resp.status_code == 200:
+                                    for it in resp.json().get('Items', []):
+                                        if it.get('Id'):
+                                            result[it['Id']] = it
+                            except Exception as e:
+                                logger.warning(f"看剧日历批量获取条目详情失败: {e}")
+                        return result
+
+                    item_ids = list(dict.fromkeys([r.item_id for r in records if r.item_id]))
+                    details = _cal_fetch_items(item_ids)
+                    # 批量获取剧集对应的系列信息（用系列海报）
+                    series_ids = list(dict.fromkeys([
+                        d.get('SeriesId') for d in details.values()
+                        if d.get('Type') == 'Episode' and d.get('SeriesId')
+                    ]))
+                    series_details = _cal_fetch_items(series_ids)
+        except Exception as e:
+            logger.warning(f"看剧日历获取Emby详情失败(用户{user.id}): {e}")
+
+        def build_poster_url(item_id, tag):
+            if not item_id or not server_url:
+                return None
+            url = f"{server_url}/emby/Items/{item_id}/Images/Primary?api_key={api_key}&maxHeight=450"
+            if tag:
+                url += f"&tag={tag}"
+            return url
+
+        def pick_year(detail):
+            if not detail:
+                return None
+            year = detail.get('ProductionYear')
+            if year:
+                return year
+            premiere = detail.get('PremiereDate')
+            if premiere:
+                try:
+                    return int(str(premiere)[:4])
+                except (TypeError, ValueError):
+                    return None
+            return None
+
+        groups_map = {}
+        order = []
+
+        def fallback_series_name(rec):
+            # 本地记录名形如 "系列 - 第X季 - 集名" 或 "系列 - 集名"
+            return (rec.item_name or '未知剧集').split(' - ')[0]
+
+        for rec in records:
+            watch_time = rec.start_time.isoformat() if rec.start_time else None
+            det = details.get(rec.item_id) if rec.item_id else None
+            is_episode = (det and det.get('Type') == 'Episode') or (
+                not det and (rec.item_type or '').lower() == 'episode')
+
+            if is_episode:
+                series_id = det.get('SeriesId') if det else None
+                group_key = 'series:' + str(series_id) if series_id else 'series-name:' + fallback_series_name(rec)
+                if group_key not in groups_map:
+                    sdet = series_details.get(series_id) if series_id else None
+                    series_name = (sdet or {}).get('Name') if sdet else None
+                    if not series_name and det:
+                        series_name = det.get('SeriesName')
+                    if not series_name:
+                        series_name = fallback_series_name(rec)
+                    poster = None
+                    if sdet:
+                        poster = build_poster_url(sdet.get('Id'), (sdet.get('ImageTags') or {}).get('Primary'))
+                    groups_map[group_key] = {
+                        'type': 'series',
+                        'series_id': series_id,
+                        'name': series_name,
+                        'year': pick_year(sdet),
+                        'poster_url': poster,
+                        'overview': (sdet or {}).get('Overview') or '' if sdet else '',
+                        'episodes': [],
+                        '_episode_keys': set(),
+                        'first_time': watch_time
+                    }
+                    order.append(group_key)
+                group = groups_map[group_key]
+
+                # 同一集多次观看：合并观看时间，不重复展示
+                ep_key = rec.item_id or ((rec.item_name or '') + (watch_time or ''))
+                if rec.item_id and rec.item_id in group['_episode_keys']:
+                    for ep in group['episodes']:
+                        if ep.get('episode_id') == rec.item_id and watch_time and watch_time not in ep['watch_times']:
+                            ep['watch_times'].append(watch_time)
+                    continue
+                group['_episode_keys'].add(ep_key)
+
+                # 剧集展示名：第X季 第Y集 集名
+                ep_name = ''
+                if det:
+                    season_no = det.get('ParentIndexNumber')
+                    ep_no = det.get('IndexNumber')
+                    if season_no is not None and ep_no is not None:
+                        ep_name = f'第{season_no}季 第{ep_no}集'
+                    elif ep_no is not None:
+                        ep_name = f'第{ep_no}集'
+                    ep_title = det.get('Name') or ''
+                    if ep_title and ep_title not in ep_name:
+                        ep_name = f'{ep_name} {ep_title}'.strip()
+                if not ep_name:
+                    # 无Emby详情时，从本地名称中去掉系列前缀
+                    parts = (rec.item_name or '').split(' - ')
+                    ep_name = ' - '.join(parts[1:]) if len(parts) > 1 else (rec.item_name or '未知剧集')
+                group['episodes'].append({
+                    'episode_id': rec.item_id,
+                    'name': ep_name,
+                    'overview': (det or {}).get('Overview') or '' if det else '',
+                    'watch_times': [watch_time] if watch_time else []
+                })
+            else:
+                group_key = 'movie:' + str(rec.item_id or rec.item_name)
+                if group_key not in groups_map:
+                    name = (det or {}).get('Name') if det else None
+                    name = name or rec.item_name or '未知影片'
+                    poster = None
+                    if rec.item_id:
+                        tag = (det.get('ImageTags') or {}).get('Primary') if det else None
+                        poster = build_poster_url(rec.item_id, tag)
+                    groups_map[group_key] = {
+                        'type': 'movie',
+                        'item_id': rec.item_id,
+                        'name': name,
+                        'year': pick_year(det),
+                        'poster_url': poster,
+                        'overview': (det or {}).get('Overview') or '' if det else '',
+                        'watch_times': [],
+                        'first_time': watch_time
+                    }
+                    order.append(group_key)
+                if watch_time and watch_time not in groups_map[group_key]['watch_times']:
+                    groups_map[group_key]['watch_times'].append(watch_time)
+
+        groups = []
+        for key in order:
+            g = groups_map[key]
+            g.pop('_episode_keys', None)
+            groups.append(g)
+
+        return jsonify({'success': True, 'data': {'date': day.isoformat(), 'groups': groups}})
     finally:
         db.close()
 
@@ -7614,8 +8461,9 @@ def api_user_renew():
         db.commit()
 
         # 启用Emby用户
-        if user.emby_user_id and EmbyAPI.is_configured():
-            EmbyAPI.enable_user(user.emby_user_id)
+        if user.emby_user_id and EmbyAPI.is_configured(user.emby_server_id):
+            with EmbyAPI.server_context(user.emby_server_id):
+                EmbyAPI.enable_user(user.emby_user_id)
 
         # 同步启用 WebDAV
         try:
@@ -7703,17 +8551,35 @@ def admin_dashboard():
         users = db.query(User).filter(User.id.in_(user_ids)).all() if user_ids else []
         user_map = {u.id: u for u in users}
 
-        # 批量获取Emby项目详情
+        # 批量获取Emby项目详情（按用户所属媒体库分组查询）
         item_details = {}
-        item_ids = [item.item_id for item in history_items if item.item_id]
-        if item_ids and EmbyAPI.is_configured():
+        item_server_map = {}  # item_id -> (server_url, api_key, server_name)
+        # 记录每个媒体库下需要查询的 item_ids
+        server_item_groups = {}
+        for item in history_items:
+            if not item.item_id:
+                continue
+            owner = user_map.get(item.user_id)
+            sid = owner.emby_server_id if owner else None
+            server_item_groups.setdefault(sid, []).append(item.item_id)
+        for sid, ids in server_item_groups.items():
+            if not EmbyAPI.is_configured(sid):
+                continue
             try:
-                details_data = EmbyAPI.get_items_by_ids_admin(item_ids)
+                details_data = EmbyAPI.get_items_by_ids_admin(list(set(ids)), server_id=sid)
                 if details_data:
                     for detail in details_data.get('Items', []):
                         item_details[detail.get('Id')] = detail
+                s_url = EmbyAPI.get_server_url(sid).rstrip('/')
+                s_key = EmbyAPI.get_api_key(sid)
+                s_name = ''
+                if sid is not None:
+                    _srv = db.query(EmbyServer).get(sid)
+                    s_name = _srv.name if _srv else ''
+                for iid in ids:
+                    item_server_map[iid] = (s_url, s_key, s_name)
             except Exception as e:
-                logger.error(f"管理员仪表盘批量获取项目详情失败: {e}")
+                logger.error(f"管理员仪表盘批量获取项目详情失败(媒体库ID={sid}): {e}")
 
         # 格式化历史记录
         formatted_history = []
@@ -7741,12 +8607,12 @@ def admin_dashboard():
             poster_url = None
             modal_image_url = None
             overview = ''
-            if item.item_id and EmbyAPI.is_configured():
+            server_name = user.emby_server.name if user and user.emby_server else ''
+            if item.item_id and item.item_id in item_server_map:
                 detail = item_details.get(item.item_id)
                 if detail:
                     overview = detail.get('Overview', '') or ''
-                    server_url = EmbyAPI.get_server_url().rstrip('/')
-                    api_key = EmbyAPI.get_api_key()
+                    server_url, api_key, _sname = item_server_map[item.item_id]
                     poster_url = f"{server_url}/emby/Items/{item.item_id}/Images/Primary?api_key={api_key}&maxHeight=120"
                     modal_image_url = f"{server_url}/emby/Items/{item.item_id}/Images/Primary?api_key={api_key}&maxHeight=600"
 
@@ -7758,21 +8624,33 @@ def admin_dashboard():
                 'watch_duration': duration_str,
                 'poster_url': poster_url,
                 'modal_image_url': modal_image_url,
-                'overview': overview
+                'overview': overview,
+                'server_name': server_name,
+                'emby_server_id': user.emby_server_id if user else None
             })
 
         total_pages = (total_records + per_page - 1) // per_page
 
-        # 正在观看的用户
+        # 正在观看的用户（聚合所有媒体库）
         active_sessions = []
-        if EmbyAPI.is_configured():
+        servers = EmbyAPI.get_all_servers(active_only=True)
+        if not servers and EmbyAPI.is_configured():
+            # 旧版单库配置兜底
+            servers = [{'id': None, 'name': ''}]
+        for srv_info in servers:
+            sid = srv_info['id']
+            if not EmbyAPI.is_configured(sid):
+                continue
             try:
-                sessions = EmbyAPI.get_active_sessions()
+                sessions = EmbyAPI.get_active_sessions(sid)
                 now_playing = [s for s in sessions if s.get('is_now_playing')]
 
-                # 映射Emby用户ID到本地用户
+                # 映射Emby用户ID到本地用户（限定在当前媒体库内）
                 emby_user_ids = [s.get('user_id') for s in now_playing if s.get('user_id')]
-                local_users = db.query(User).filter(User.emby_user_id.in_(emby_user_ids)).all() if emby_user_ids else []
+                q = db.query(User).filter(User.emby_user_id.in_(emby_user_ids))
+                if sid is not None:
+                    q = q.filter(User.emby_server_id == sid)
+                local_users = q.all() if emby_user_ids else []
                 emby_to_local = {u.emby_user_id: u for u in local_users}
 
                 # 批量获取正在播放项目详情
@@ -7780,12 +8658,16 @@ def admin_dashboard():
                 active_item_details = {}
                 if active_item_ids:
                     try:
-                        details_data = EmbyAPI.get_items_by_ids_admin(active_item_ids)
+                        details_data = EmbyAPI.get_items_by_ids_admin(active_item_ids, server_id=sid)
                         if details_data:
                             for detail in details_data.get('Items', []):
                                 active_item_details[detail.get('Id')] = detail
                     except Exception as e:
-                        logger.error(f"管理员仪表盘批量获取正在播放项目详情失败: {e}")
+                        logger.error(f"管理员仪表盘批量获取正在播放项目详情失败(媒体库ID={sid}): {e}")
+
+                server_url = EmbyAPI.get_server_url(sid).rstrip('/')
+                api_key = EmbyAPI.get_api_key(sid)
+                server_name = srv_info.get('name') or ''
 
                 for session in now_playing:
                     emby_user_id = session.get('user_id')
@@ -7795,8 +8677,6 @@ def admin_dashboard():
                     detail = active_item_details.get(item_id, {})
                     overview = detail.get('Overview', '') or ''
 
-                    server_url = EmbyAPI.get_server_url().rstrip('/')
-                    api_key = EmbyAPI.get_api_key()
                     poster_url = None
                     modal_image_url = None
                     if item_id:
@@ -7826,10 +8706,12 @@ def admin_dashboard():
                         'progress': progress_str,
                         'poster_url': poster_url,
                         'modal_image_url': modal_image_url,
-                        'overview': overview
+                        'overview': overview,
+                        'emby_server_id': sid,
+                        'server_name': server_name
                     })
             except Exception as e:
-                logger.error(f"管理员仪表盘获取正在观看会话失败: {e}")
+                logger.error(f"管理员仪表盘获取正在观看会话失败(媒体库ID={sid}): {e}")
 
         return render_template('admin/dashboard.html',
             history_items=formatted_history,
@@ -7845,29 +8727,49 @@ def admin_dashboard():
 @app.route('/api/admin/active-sessions', methods=['GET'])
 @admin_required
 def api_admin_active_sessions():
-    """实时获取正在观看的用户会话"""
+    """实时获取正在观看的用户会话（聚合所有媒体库，可用 ?server_id= 过滤）"""
+    filter_server_id = request.args.get('server_id', type=int)
     db = get_db()
     try:
         active_sessions = []
-        if EmbyAPI.is_configured():
+        if filter_server_id is not None:
+            servers = [{'id': filter_server_id, 'name': ''}]
+        else:
+            servers = EmbyAPI.get_all_servers(active_only=True)
+            if not servers and EmbyAPI.is_configured():
+                servers = [{'id': None, 'name': ''}]
+        for srv_info in servers:
+            sid = srv_info['id']
+            if not EmbyAPI.is_configured(sid):
+                continue
             try:
-                sessions = EmbyAPI.get_active_sessions()
+                sessions = EmbyAPI.get_active_sessions(sid)
                 now_playing = [s for s in sessions if s.get('is_now_playing')]
 
                 emby_user_ids = [s.get('user_id') for s in now_playing if s.get('user_id')]
-                local_users = db.query(User).filter(User.emby_user_id.in_(emby_user_ids)).all() if emby_user_ids else []
+                q = db.query(User).filter(User.emby_user_id.in_(emby_user_ids))
+                if sid is not None:
+                    q = q.filter(User.emby_server_id == sid)
+                local_users = q.all() if emby_user_ids else []
                 emby_to_local = {u.emby_user_id: u for u in local_users}
 
                 active_item_ids = [s.get('item_id') for s in now_playing if s.get('item_id')]
                 active_item_details = {}
                 if active_item_ids:
                     try:
-                        details_data = EmbyAPI.get_items_by_ids_admin(active_item_ids)
+                        details_data = EmbyAPI.get_items_by_ids_admin(active_item_ids, server_id=sid)
                         if details_data:
                             for detail in details_data.get('Items', []):
                                 active_item_details[detail.get('Id')] = detail
                     except Exception as e:
-                        logger.error(f"实时会话批量获取项目详情失败: {e}")
+                        logger.error(f"实时会话批量获取项目详情失败(媒体库ID={sid}): {e}")
+
+                server_url = EmbyAPI.get_server_url(sid).rstrip('/')
+                api_key = EmbyAPI.get_api_key(sid)
+                server_name = srv_info.get('name') or ''
+                if not server_name and sid is not None:
+                    _srv = db.query(EmbyServer).get(sid)
+                    server_name = _srv.name if _srv else ''
 
                 for session in now_playing:
                     emby_user_id = session.get('user_id')
@@ -7877,8 +8779,6 @@ def api_admin_active_sessions():
                     detail = active_item_details.get(item_id, {})
                     overview = detail.get('Overview', '') or ''
 
-                    server_url = EmbyAPI.get_server_url().rstrip('/')
-                    api_key = EmbyAPI.get_api_key()
                     poster_url = None
                     modal_image_url = None
                     if item_id:
@@ -7914,10 +8814,12 @@ def api_admin_active_sessions():
                         'progress_percent': progress_percent,
                         'poster_url': poster_url,
                         'modal_image_url': modal_image_url,
-                        'overview': overview
+                        'overview': overview,
+                        'emby_server_id': sid,
+                        'server_name': server_name
                     })
             except Exception as e:
-                logger.error(f"实时获取正在观看会话失败: {e}")
+                logger.error(f"实时获取正在观看会话失败(媒体库ID={sid}): {e}")
 
         return jsonify({'success': True, 'data': active_sessions})
     finally:
@@ -8095,11 +8997,16 @@ def api_admin_users_list():
     try:
         search = request.args.get('search', '').strip()
         exclude_whitelist = request.args.get('exclude_whitelist', 'false').lower() == 'true'
+        server_id = request.args.get('server_id', type=int)
 
         query = db.query(User).filter(User.role == UserRole.USER)
 
+        # 按媒体库过滤（不传则全局搜索所有媒体库）
+        if server_id:
+            query = query.filter(User.emby_server_id == server_id)
+
         if search:
-            # 支持搜索用户名或邮箱
+            # 支持搜索用户名或邮箱（跨所有已绑定媒体库全局搜索）
             query = query.filter(
                 or_(
                     User.username.contains(search),
@@ -8114,7 +9021,7 @@ def api_admin_users_list():
             if whitelist_user_ids:
                 query = query.filter(~User.id.in_(whitelist_user_ids))
 
-        users = query.order_by(User.created_at.desc()).limit(50).all()
+        users = query.order_by(User.created_at.desc()).limit(100).all()
 
         return jsonify({
             'success': True,
@@ -8123,6 +9030,8 @@ def api_admin_users_list():
                 'username': u.username,
                 'email': u.email,
                 'emby_user_id': u.emby_user_id,
+                'emby_server_id': u.emby_server_id,
+                'emby_server_name': u.emby_server.name if u.emby_server else None,
                 'coins': u.coins,
                 'is_active': u.is_active
             } for u in users]
@@ -8306,11 +9215,12 @@ def user_history():
         
         # 批量获取Emby项目详情（封面、简介等）
         item_details = {}
-        if user.emby_user_id and EmbyAPI.is_configured():
+        if user.emby_user_id and EmbyAPI.is_configured(user.emby_server_id):
             item_ids = [item.item_id for item in history_items if item.item_id]
             if item_ids:
                 try:
-                    details_data = EmbyAPI.get_items_by_ids(user.emby_user_id, item_ids)
+                    with EmbyAPI.server_context(user.emby_server_id):
+                        details_data = EmbyAPI.get_items_by_ids(user.emby_user_id, item_ids)
                     if details_data:
                         for detail in details_data.get('Items', []):
                             item_details[detail.get('Id')] = detail
@@ -8343,12 +9253,12 @@ def user_history():
             poster_url = None
             modal_image_url = None
             overview = ''
-            if item.item_id and user.emby_user_id and EmbyAPI.is_configured():
+            if item.item_id and user.emby_user_id and EmbyAPI.is_configured(user.emby_server_id):
                 detail = item_details.get(item.item_id)
                 if detail:
                     overview = detail.get('Overview', '') or ''
-                    server_url = EmbyAPI.get_server_url().rstrip('/')
-                    api_key = EmbyAPI.get_api_key()
+                    server_url = EmbyAPI.get_server_url(user.emby_server_id).rstrip('/')
+                    api_key = EmbyAPI.get_api_key(user.emby_server_id)
                     poster_url = f"{server_url}/emby/Items/{item.item_id}/Images/Primary?api_key={api_key}&maxHeight=120"
                     modal_image_url = f"{server_url}/emby/Items/{item.item_id}/Images/Primary?api_key={api_key}&maxHeight=600"
 
@@ -8409,41 +9319,67 @@ def user_payment():
 @app.route('/user/server')
 @login_required_not_expired
 def user_server_page():
-    """用户查看服务器信息页面"""
+    """用户查看服务器信息页面（仅显示自己所属媒体库的访问地址）"""
     db = get_db()
     try:
-        config = db.query(SystemConfig).filter_by(key='emby_server_url').first()
-        emby_server_url = config.value if config else ''
-        
-        config = db.query(SystemConfig).filter_by(key='emby_api_key').first()
-        emby_api_key = config.value if config else ''
-        
-        # 解析URL获取域名/IP和端口
-        server_host = ''
-        server_port = ''
-        if emby_server_url:
-            try:
-                from urllib.parse import urlparse
-                parsed = urlparse(emby_server_url)
-                server_host = parsed.hostname or ''
-                server_port = str(parsed.port) if parsed.port else '8096'
-            except:
-                server_host = emby_server_url
-                server_port = ''
-        
+        user = db.query(User).get(session['user_id'])
+        from urllib.parse import urlparse
+
+        def _parse_address(raw_url, label=''):
+            host = ''
+            port = ''
+            if raw_url:
+                try:
+                    parsed = urlparse(raw_url)
+                    host = parsed.hostname or ''
+                    port = str(parsed.port) if parsed.port else '8096'
+                except Exception:
+                    host = raw_url
+                    port = ''
+            return {'label': label or '默认地址', 'host': host, 'port': port, 'url': raw_url or ''}
+
+        # 用户只能看到自己所属媒体库的地址
+        addresses = []
+        emby_server_url = ''
+        emby_server = user.emby_server if user else None
+        if emby_server:
+            emby_server_url = emby_server.server_url or ''
+            saved_addresses = emby_server.get_addresses()
+            if saved_addresses:
+                for addr in saved_addresses:
+                    addresses.append({
+                        'label': addr.get('label') or '访问地址',
+                        'host': addr.get('host') or '',
+                        'port': str(addr.get('port')) if addr.get('port') else '',
+                        'url': addr.get('url') or ''
+                    })
+            else:
+                addresses.append(_parse_address(emby_server_url))
+        else:
+            # 兼容历史数据：用户尚未归属媒体库时回退到旧配置
+            config = db.query(SystemConfig).filter_by(key='emby_server_url').first()
+            emby_server_url = config.value if config else ''
+            if emby_server_url:
+                addresses.append(_parse_address(emby_server_url))
+
+        server_host = addresses[0]['host'] if addresses else ''
+        server_port = addresses[0]['port'] if addresses else ''
+
         # 获取默认弹幕API
         danmaku_api = db.query(DanmakuAPI).filter_by(is_active=True, is_default=True).first()
         if not danmaku_api:
             # 如果没有默认的，获取第一个启用的
             danmaku_api = db.query(DanmakuAPI).filter_by(is_active=True).order_by(DanmakuAPI.created_at.desc()).first()
-        
+
         danmaku_api_name = danmaku_api.name if danmaku_api else None
         danmaku_api_url = danmaku_api.url if danmaku_api else None
-        
+
         return render_template('user/server.html',
                              server_host=server_host,
                              server_port=server_port,
                              server_url=emby_server_url,
+                             server_addresses=addresses,
+                             emby_server_name=emby_server.name if emby_server else None,
                              danmaku_api_name=danmaku_api_name,
                              danmaku_api_url=danmaku_api_url)
     finally:
@@ -8516,7 +9452,9 @@ def check_expired_users():
                         # 禁用Emby用户访问权限
                         if user.emby_user_id:
                             try:
-                                if EmbyAPI.disable_user(user.emby_user_id):
+                                with EmbyAPI.server_context(user.emby_server_id):
+                                    disabled_result = EmbyAPI.disable_user(user.emby_user_id)
+                                if disabled_result:
                                     user.emby_access_disabled = True
                                     try:
                                         db.commit()
@@ -8593,7 +9531,8 @@ def sync_watch_history_scheduler():
                     if user.emby_user_id:
                         try:
                             logger.info(f"正在同步用户 {user.username} 的观看记录")
-                            success = EmbyAPI.sync_user_watch_history(user.id, user.emby_user_id)
+                            with EmbyAPI.server_context(user.emby_server_id):
+                                success = EmbyAPI.sync_user_watch_history(user.id, user.emby_user_id)
                             if success:
                                 synced_count += 1
                                 logger.info(f"成功同步用户 {user.username} 的观看记录")
@@ -8977,7 +9916,9 @@ def api_update_emby_policy():
             try:
                 # 已过期或被标记为Emby访问禁用的用户必须保持禁用状态，避免规则更新后重新启用
                 is_disabled = not user.is_active or user.is_expired() or user.emby_access_disabled
-                if EmbyAPI.apply_default_policy(user.emby_user_id, is_disabled=is_disabled):
+                with EmbyAPI.server_context(user.emby_server_id):
+                    policy_ok = EmbyAPI.apply_default_policy(user.emby_user_id, is_disabled=is_disabled)
+                if policy_ok:
                     applied_count += 1
                     logger.info(f"已将新策略应用到用户 {user.username} (Emby ID: {user.emby_user_id}, 禁用={is_disabled})")
                 else:
@@ -9887,12 +10828,13 @@ def api_validate_coupon():
 @app.route('/api/admin/emby-libraries', methods=['GET'])
 @admin_required
 def api_get_emby_libraries():
-    """获取Emby媒体库列表"""
+    """获取Emby媒体库列表（可通过 ?server_id= 指定媒体库）"""
     try:
-        if not EmbyAPI.is_configured():
+        server_id = request.args.get('server_id', type=int)
+        if not EmbyAPI.is_configured(server_id):
             return jsonify({'success': False, 'message': 'Emby未配置'}), 400
-        
-        libraries = EmbyAPI.get_libraries()
+
+        libraries = EmbyAPI.get_libraries(server_id)
         if libraries is None:
             logger.warning("获取Emby媒体库列表返回None")
             return jsonify({'success': False, 'message': '无法从Emby服务器获取媒体库列表'}), 500
@@ -10068,9 +11010,11 @@ def api_purchase_package():
             if user.emby_user_id:
                 try:
                     import threading
+                    _grant_emby_server_id = user.emby_server_id
                     def sync_emby():
                         try:
-                            EmbyAPI.enable_user(user.emby_user_id)
+                            with EmbyAPI.server_context(_grant_emby_server_id):
+                                EmbyAPI.enable_user(user.emby_user_id)
                             logger.info(f"已同步启用Emby用户: {user.emby_user_id}")
                         except Exception as e:
                             logger.error(f"同步启用Emby用户失败: {e}")
@@ -11698,6 +12642,7 @@ def forgot_password_step3():
     email = token_data['email']
     username = None
     emby_user_id = None
+    emby_server_id = None
 
     # 第一步：更新本地密码
     db = get_db()
@@ -11713,6 +12658,7 @@ def forgot_password_step3():
 
         username = user.username
         emby_user_id = user.emby_user_id
+        emby_server_id = user.emby_server_id
 
         # 生成新密码哈希并更新
         new_hash = generate_password_hash(new_password)
@@ -11764,9 +12710,10 @@ def forgot_password_step3():
 
     # 第三步：同步到Emby（不影响本地密码修改结果）
     emby_sync_success = True
-    if emby_user_id and EmbyAPI.is_configured():
+    if emby_user_id and EmbyAPI.is_configured(emby_server_id):
         try:
-            emby_sync_success = EmbyAPI.update_password(emby_user_id, new_password)
+            with EmbyAPI.server_context(emby_server_id):
+                emby_sync_success = EmbyAPI.update_password(emby_user_id, new_password)
             if emby_sync_success:
                 logger.info(f"Emby密码同步成功: {username}")
             else:
@@ -11939,6 +12886,28 @@ def api_admin_add_client():
 
             db.add(client)
             db.commit()
+
+            # 同一平台类型只保留最新安装包：删除该类型下的其他记录及其磁盘文件，节约服务器空间
+            try:
+                old_clients = db.query(ClientDownload).filter(
+                    ClientDownload.client_type == client_type_enum,
+                    ClientDownload.id != client.id
+                ).all()
+                for old_client in old_clients:
+                    if old_client.file_path:
+                        old_file_path = os.path.join(CLIENT_DOWNLOADS_DIR, old_client.file_path)
+                        if os.path.exists(old_file_path):
+                            try:
+                                os.remove(old_file_path)
+                            except Exception as file_err:
+                                logger.error(f"删除旧客户端安装包文件失败: {old_file_path}, 错误: {file_err}")
+                    db.delete(old_client)
+                if old_clients:
+                    db.commit()
+                    logger.info(f"新安装包上传后已删除同类型旧安装包 {len(old_clients)} 个: {client_type}")
+            except Exception as replace_err:
+                db.rollback()
+                logger.error(f"替换同类型旧安装包失败: {replace_err}")
 
             logger.info(f"管理员添加客户端: {name} ({client_type})")
             return jsonify({

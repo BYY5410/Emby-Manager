@@ -1,0 +1,48 @@
+# =============================================================
+# Emby Manager - Docker Compose 部署（推荐方式）
+#
+# 使用方法：
+#   1. 复制环境变量模板：  cp .env.example .env   （Windows: copy .env.example .env）
+#   2. 启动：             docker compose up -d --build
+#   3. 查看日志：         docker compose logs -f
+#   4. 停止：             docker compose down
+#
+# 数据全部保存在 Docker 数据卷中，升级镜像（重新 build）不会丢失
+# 数据库、用户上传的客户端、收款码等数据。
+# =============================================================
+services:
+  emby-manager:
+    build: .
+    image: emby-manager:latest
+    container_name: emby-manager
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-5001}:5001"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      # 建议在 .env 中设置固定的随机长字符串，容器重建后登录态不失效
+      EMBY_MANAGER_SECRET_KEY: ${EMBY_MANAGER_SECRET_KEY:-}
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-2}
+      GUNICORN_THREADS: ${GUNICORN_THREADS:-8}
+      GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-120}
+    volumes:
+      - emby-database:/app/database
+      - emby-logs:/app/logs
+      - emby-cache:/app/cache
+      - emby-clients:/app/static/downloads/clients
+      - emby-images:/app/static/images
+      - emby-uploads:/app/static/uploads
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5001/login', timeout=8).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 45s
+      retries: 5
+
+volumes:
+  emby-database:
+  emby-logs:
+  emby-cache:
+  emby-clients:
+  emby-images:
+  emby-uploads:

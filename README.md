@@ -1,295 +1,415 @@
-# Emby Manager - Emby用户管理系统
+# Emby Manager · Emby 用户管理系统
 
-一个基于 Flask + SQLite 的 Emby 用户管理系统，支持激活码注册、用户续期、观看记录同步、工单系统、客户端下载等功能。
+![Python](https://img.shields.io/badge/Python-3.8%20~%203.13-3776AB?logo=python&logoColor=white)
+![Flask](https://img.shields.io/badge/Flask-2.3%2B-000000?logo=flask)
+![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)
+![Database](https://img.shields.io/badge/Database-SQLite-003B57?logo=sqlite&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green)
+
+一个基于 **Flask + SQLite** 的 Emby 用户运营管理系统，粉色少女心风格 UI，开箱即用。
+支持激活码注册、套餐续期、Emby 策略自动巡查、观看记录同步、**看剧日历**、金币商城、在线工单、客户端分发等完整运营能力，并提供 **Docker / Docker Compose 一键部署**。
+
+---
+
+## 目录
+
+- [功能特性](#功能特性)
+- [在线预览结构](#页面结构)
+- [快速开始（Docker 部署）](#快速开始docker-部署)
+- [其他 Docker 安装方式](#其他-docker-安装方式)
+- [传统方式部署](#传统方式部署)
+- [数据持久化与备份](#数据持久化与备份)
+- [已有数据迁移到 Docker](#已有数据迁移到-docker)
+- [环境变量说明](#环境变量说明)
+- [默认账号](#默认账号)
+- [目录结构](#目录结构)
+- [技术栈](#技术栈)
+- [主要接口一览](#主要接口一览)
+- [更新日志](#更新日志)
+- [安全建议](#安全建议)
+- [许可证](#许可证)
+
+---
 
 ## 功能特性
 
-### 用户管理
-- **多角色支持**：管理员和普通用户角色分离
-- **激活码系统**：生成和管理激活码，支持多种时长类型（小时/天/周/月/年/永久）
-- **到期提醒**：自动检查并禁用到期用户
-- **登录安全**：登录失败限制、CSRF防护、密码加密存储
+### 👤 用户与账号体系
+- 管理员 / 普通用户双角色，后台用户列表支持搜索、筛选、批量管理
+- **激活码注册**：支持小时卡 / 天卡 / 周卡 / 月卡 / 年卡 / 永久等多种时长
+- 用户续期、立即到期、手动禁用/启用、到期自动处理
+- 用户详情弹窗展示真实的注册时间、到期时间、最后登录、最近观看记录与观看统计图表
+- 邮箱验证码注册、邮箱找回密码
+- 登录失败次数限制、修改密码频率与 IP 限制
 
-### Emby集成
-- **服务器绑定**：绑定Emby服务器，自动同步用户状态
-- **观看记录**：同步用户观看历史，支持剧集信息展示
-- **媒体库管理**：管理用户可访问的媒体库权限
-- **自动禁用**：到期自动禁用Emby用户访问权限
+### 🎬 Emby 集成
+- 多 Emby 媒体库绑定（服务器地址 + API 密钥），编辑态一键"测试连接"
+- 用户媒体库访问权限管理
+- 定时**策略巡查**：到期/禁用用户自动收回 Emby 访问权限，白名单用户豁免
+- 每日零点自动同步用户观看记录（与服务器时区保持一致）
+- WebDAV 用户自动分配
 
-### 支付与财务
-- **支付审核**：管理员审核用户支付订单
-- **退款处理**：支持上传退款收款码，处理退款请求
-- **金币系统**：金币充值、套餐购买
-- **订单管理**：完整的订单生命周期管理
+### 📅 看剧日历（仪表盘）
+- 近 12 个月的看剧日程总览，支持箭头与月份选择器切换年月、一键回到今天
+- 涂鸦风格标识：**有看剧（跳动爱心+条数徽标）/ 今天（金色星星描边）/ 已过去（淡空心心）/ 未来日期（无标识）**
+- 点击日期弹出当天**海报时间线**：影片 Primary 海报封面（非背景图）+ 名称 + 上映年份
+- 点击海报查看详情：剧集显示系列简介与当天观看的每一集（集名、观看时间、本集简介）；电影显示影片简介
+- **仅激活有效期内用户可查看**：套餐过期后日历卡片自动锁定并引导前往续期，接口同步返回 403
 
-### 客户端支持
-- **客户端下载**：管理各类客户端（Android/iOS/Windows/Mac/Linux）
-- **多格式支持**：支持APK、IPA、EXE、DMG、DEB等多种格式
-- **下载统计**：记录客户端下载次数
+### 💰 运营与支付
+- 金币充值、套餐商城、礼品卡
+- 支付订单提交与管理员审核、批量处理
+- 退款申请与退款收款码管理
 
-### 工单系统
-- **在线客服**：用户与管理员实时沟通
-- **图片支持**：支持粘贴截图和上传图片
-- **消息已读**：实时显示消息已读状态
-- **工单分类**：账号问题、技术问题、其他问题
+### 🎫 工单与文档
+- 用户在线工单（账号 / 技术 / 其他分类），支持粘贴与上传截图、消息已读状态
+- 管理员工单回复与处理
+- 内置客户端使用文档、服务条款、隐私政策页面
 
-### 系统优化
-- **生产环境支持**：支持6000并发用户架构设计
-- **性能优化**：数据库连接池、缓存层、多进程部署
-- **安全防护**：文件上传校验、登录限制、SQL注入防护
-- **定时任务**：每日零时自动同步观看记录
+### 📦 客户端分发
+- 管理与分发 Android / iOS / Windows / macOS / Linux 客户端
+- 支持 APK / IPA / EXE / DMG / MSIX / DEB 等格式，下载次数统计
+- 客户端下载页同样仅对有效期内用户开放
 
-## 快速开始
+### 🛡 系统与运维
+- Docker / Docker Compose 一键部署，内置健康检查，数据卷持久化
+- Gunicorn（Linux 容器）/ Waitress（Windows）多线程生产服务器
+- 文件上传魔数 + 扩展名白名单、SQLAlchemy 参数化查询、模板自动转义
+- 响应压缩、接口限流、完整操作日志
+
+---
+
+## 页面结构
+
+| 角色 | 主要页面 |
+| --- | --- |
+| 游客 | 首页、登录、注册（激活码+邮箱验证）、忘记密码、服务条款、隐私政策 |
+| 普通用户 | 仪表盘（统计卡片、观看趋势、**看剧日历**、最近观看）、观看历史、媒体库、金币充值、套餐商城、客户端下载、使用文档、我的工单、个人信息 |
+| 管理员 | 运营仪表盘、用户管理、激活码管理、绑定媒体库、支付审核、客户端管理、工单管理、系统设置、个人信息 |
+
+---
+
+## 快速开始（Docker 部署）
+
+适用于任意安装了 **Docker Engine 20.10+ / Docker Desktop（含 Compose v2）** 的 Linux、Windows、macOS。
+
+### 1. 获取项目
+
+```bash
+git clone <你的仓库地址> emby-manager
+cd emby-manager
+```
+
+### 2. 准备环境变量（可选但推荐）
+
+```bash
+# Linux / macOS
+cp .env.example .env
+
+# Windows PowerShell
+copy .env.example .env
+```
+
+编辑 `.env`，建议至少设置一个固定的 `EMBY_MANAGER_SECRET_KEY`（容器重建后登录态不会失效）：
+
+```bash
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+### 3. 一条命令启动
+
+```bash
+docker compose up -d --build
+```
+
+首次启动会自动：构建镜像 → 初始化 SQLite 数据库与数据表 → 创建默认管理员 → 启动定时任务。
+
+### 4. 访问
+
+- 首页：`http://<服务器IP>:5001/`
+- 登录：`http://<服务器IP>:5001/login`
+- 默认管理员：**admin / 123**（首次登录后请立即修改密码）
+
+查看运行状态与日志：
+
+```bash
+docker compose ps          # 健康状态（healthy）
+docker compose logs -f     # 实时日志
+```
+
+---
+
+## 其他 Docker 安装方式
+
+### 方式 A：纯 `docker` 命令（没有 Compose 插件时）
+
+项目内置等价脚本，自动完成构建、建卷、删除旧容器、启动：
+
+```bash
+# Linux / macOS
+chmod +x docker/run-docker.sh
+./docker/run-docker.sh
+
+# Windows PowerShell
+powershell -ExecutionPolicy Bypass -File .\docker\run-docker.ps1
+```
+
+自定义对外端口：
+
+```bash
+APP_PORT=5050 ./docker/run-docker.sh        # Linux/macOS
+$env:APP_PORT="5050"; .\docker\run-docker.ps1   # Windows
+```
+
+### 方式 B：手动逐条执行 docker 命令
+
+```bash
+# 构建镜像
+docker build -t emby-manager:latest .
+
+# 创建数据卷
+docker volume create emby-database
+docker volume create emby-logs
+docker volume create emby-cache
+docker volume create emby-clients
+docker volume create emby-images
+docker volume create emby-uploads
+
+# 启动容器
+docker run -d \
+  --name emby-manager \
+  --restart unless-stopped \
+  -p 5001:5001 \
+  -e TZ=Asia/Shanghai \
+  -v emby-database:/app/database \
+  -v emby-logs:/app/logs \
+  -v emby-cache:/app/cache \
+  -v emby-clients:/app/static/downloads/clients \
+  -v emby-images:/app/static/images \
+  -v emby-uploads:/app/static/uploads \
+  emby-manager:latest
+```
+
+### 方式 C：docker-compose 旧版（v1，命令带横杠）
+
+```bash
+docker-compose up -d --build
+```
+
+---
+
+## 传统方式部署
 
 ### 环境要求
 
-- Python 3.10+
-- pip 包管理器
+- Python 3.10 ~ 3.12
+- Windows / Linux / macOS 均可
 
-### 安装步骤
-
-#### 方式1：使用启动脚本（推荐）
+### 启动步骤
 
 ```bash
-# 1. 安装依赖
-python start_production.py --install
-
-# 2. 启动服务器
-python start_production.py --waitress
-```
-
-#### 方式2：手动安装
-
-```bash
-# 1. 安装依赖
 pip install -r requirements.txt
 
-# 2. 启动开发服务器
-python app.py
-
-# 或启动生产服务器（推荐）
+# Windows（Waitress，推荐）
 python start_production.py --waitress
+
+# Linux / macOS（Gunicorn，推荐）
+python start_production.py --gunicorn
+
+# 开发调试
+python app.py
 ```
 
-### 访问地址
+> 首次运行会自动创建 `database/emby_manager.db` 与默认管理员。
+> 更详细的 Nginx 反向代理、高并发调优说明见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
-- 首页：`http://localhost:5001/`
-- 登录页面：`http://localhost:5001/login`
-- 注册页面：`http://localhost:5001/register`
-- 管理后台：`http://localhost:5001/admin/dashboard`
-- 用户中心：`http://localhost:5001/user/dashboard`
+---
+
+## 数据持久化与备份
+
+Docker 方式下，所有业务数据均保存在**数据卷**中，升级/重建镜像不会丢失：
+
+| 数据卷 | 容器内路径 | 内容 |
+| --- | --- | --- |
+| `emby-database` | `/app/database` | SQLite 数据库（用户、订单、配置、观看记录等全部业务数据） |
+| `emby-logs` | `/app/logs` | 运行日志 |
+| `emby-cache` | `/app/cache` | 文件缓存 |
+| `emby-clients` | `/app/static/downloads/clients` | 管理员上传的客户端安装包 |
+| `emby-images` | `/app/static/images` | 收款码、退款码等图片 |
+| `emby-uploads` | `/app/static/uploads` | 工单等场景的用户上传图片 |
+
+### 备份数据库
+
+```bash
+# 方法一：docker cp（简单直接）
+docker cp emby-manager:/app/database/emby_manager.db ./emby_manager.backup.db
+
+# 方法二：通过临时容器打包整个数据卷
+docker run --rm -v emby-database:/data -v "$PWD":/backup alpine \
+  tar czf /backup/emby-database-backup.tar.gz -C /data .
+```
+
+恢复时反向拷回 `/app/database/` 并重启容器即可。建议在业务低峰期操作。
+
+### 升级版本
+
+```bash
+git pull
+docker compose up -d --build      # 数据卷保留，仅替换程序
+```
+
+---
+
+## 已有数据迁移到 Docker
+
+如果此前是传统方式部署（如 Windows 上的 `start_production.py`），希望迁入容器：
+
+1. 先用 compose 启动一次新容器（自动建好数据卷），然后停止：
+
+```bash
+docker compose up -d
+docker compose stop
+```
+
+2. 将旧数据拷入容器对应路径：
+
+```bash
+# 数据库（最重要）
+docker cp database/emby_manager.db emby-manager:/app/database/
+
+# 可选：客户端安装包、收款码、上传图片
+docker cp static/downloads/clients/. emby-manager:/app/static/downloads/clients/
+docker cp static/images/. emby-manager:/app/static/images/
+docker cp static/uploads/. emby-manager:/app/static/uploads/
+```
+
+3. 重新启动：
+
+```bash
+docker compose up -d
+docker compose logs -f
+```
+
+> ⚠️ 镜像本身**不包含**任何业务数据库（`.dockerignore` 已排除 `*.db` 与用户上传内容），请勿将含真实用户信息和 Emby API 密钥的数据库提交到公开 Git 仓库。
+
+---
+
+## 环境变量说明
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `APP_PORT` | `5001` | 仅 compose 使用，宿主机暴露端口 |
+| `TZ` | `Asia/Shanghai` | 容器时区；每日零点同步依赖此项，请勿随意修改 |
+| `EMBY_MANAGER_SECRET_KEY` | 空（每次重启随机） | Flask 会话密钥，**建议固定设置**，避免容器重建后全体掉线 |
+| `GUNICORN_WORKERS` | `2` | Gunicorn worker 进程数 |
+| `GUNICORN_THREADS` | `8` | 每 worker 线程数 |
+| `GUNICORN_TIMEOUT` | `120` | 请求超时（秒） |
+| `GUNICORN_LOG_LEVEL` | `info` | Gunicorn 日志级别 |
+
+> SQLite 单机部署建议保持默认并发（2 × 8）。若上调 worker 数，请确认磁盘 IO 与 CPU 充足。
+
+---
 
 ## 默认账号
 
-系统初始化时会自动创建默认管理员账号：
+系统首次初始化时自动创建：
 
-- **用户名**：`admin`
-- **密码**：`123`
+- 用户名：`admin`
+- 密码：`123`
 
-**注意**：首次登录后请立即修改默认密码！
+**首次登录后请立即在"个人信息"中修改密码。**
+
+---
 
 ## 目录结构
 
 ```
-V16/
-├── app.py                      # 主应用文件
-├── start_production.py         # 生产环境启动脚本
-├── requirements.txt            # Python依赖
-├── README.md                   # 项目说明
-├── gunicorn.conf.py           # Gunicorn配置（Linux/Mac）
+emby-manager/
+├── app.py                     # Flask 主应用（路由、模型、定时任务、Emby API）
+├── start_production.py        # 传统部署启动脚本（Waitress/Gunicorn）
+├── gunicorn.conf.py           # 传统部署 Gunicorn 配置
 ├── production_config.py       # 生产环境配置
-├── nginx.conf                 # Nginx反向代理配置
-├── DEPLOYMENT.md              # 部署文档
+├── requirements.txt           # Python 依赖
 │
-├── database/
-│   ├── models.py              # 数据库模型
-│   └── emby_manager.db        # SQLite数据库（自动创建）
+├── Dockerfile                 # Docker 镜像构建文件
+├── docker-compose.yml         # Docker Compose 编排（推荐）
+├── .dockerignore
+├── .env.example               # 环境变量模板
+├── docker/
+│   ├── gunicorn.conf.py       # 容器专用 Gunicorn 配置（env 可调、stdout 日志）
+│   ├── run-docker.sh          # 纯 docker 部署脚本（Linux/macOS）
+│   └── run-docker.ps1         # 纯 docker 部署脚本（Windows）
 │
-├── templates/
-│   ├── index.html             # 首页
-│   ├── login.html             # 登录页
-│   ├── register.html          # 注册页
-│   ├── admin/                 # 管理员页面
-│   │   ├── dashboard.html
-│   │   ├── users.html
-│   │   ├── activation.html
-│   │   ├── bind.html
-│   │   ├── payment_audit.html
-│   │   ├── client_downloads.html
-│   │   ├── tickets.html
-│   │   └── profile.html
-│   └── user/                  # 用户页面
-│       ├── base.html
-│       ├── dashboard.html
-│       ├── history.html
-│       ├── profile.html
-│       ├── payment.html
-│       ├── recharge.html
-│       ├── server.html
-│       ├── client_downloads.html
-│       └── tickets.html
-│
-├── static/
-│   ├── css/                   # 样式文件
-│   ├── js/                    # JavaScript文件
-│   ├── images/                # 图片资源
-│   │   ├── refund_qrcodes/   # 退款收款码
-│   │   └── clients/          # 客户端图标
-│   └── downloads/            # 客户端下载文件
-│       └── clients/
-│
-├── logs/                     # 日志文件
-├── cache/                    # 缓存文件
-└── sessions/                 # 会话文件
+├── database/                  # SQLite 数据库目录（运行时自动生成）
+├── templates/                 # Jinja2 模板（admin / user / 公共页面）
+├── static/                    # 样式、脚本、图片、上传与客户端下载目录
+├── logs/  cache/  sessions/   # 运行时目录
+├── README.md
+└── DEPLOYMENT.md              # 传统部署 / Nginx / 高并发详细文档
 ```
 
-## 使用说明
-
-### 管理员操作
-
-1. **登录后台**：使用默认账号 `admin/123` 登录
-2. **生成激活码**：在"激活码管理"页面生成不同类型的激活码
-3. **管理用户**：在"用户管理"页面查看、续期、禁用/启用用户
-4. **绑定Emby**：在"绑定媒体库"页面配置服务器地址和API密钥
-5. **支付审核**：在"支付审核"页面审核用户支付订单
-6. **客户端管理**：在"客户端管理"页面上传和管理客户端
-7. **工单处理**：在"工单管理"页面处理用户工单
-
-### 普通用户操作
-
-1. **注册账号**：使用管理员生成的激活码进行注册
-2. **登录系统**：使用注册的账号密码登录
-3. **查看信息**：在个人中心查看账户状态和到期时间
-4. **续期账户**：使用新的激活码或在线支付进行续期
-5. **观看记录**：在"观看历史"页面查看同步的观看记录
-6. **下载客户端**：在"客户端下载"页面下载各类客户端
-7. **提交工单**：在"我的工单"页面提交问题反馈
-
-## API接口
-
-### 认证相关
-- `POST /api/login` - 用户登录
-- `POST /api/logout` - 用户登出
-- `POST /api/register` - 用户注册
-- `POST /api/change-password` - 修改密码
-- `GET /api/check-session` - 检查登录状态
-
-### 管理员接口
-- `GET /api/admin/users` - 获取用户列表
-- `POST /api/admin/users/delete` - 删除用户
-- `POST /api/admin/users/renew` - 用户续期
-- `POST /api/admin/users/toggle` - 切换用户状态
-- `GET /api/admin/codes` - 获取激活码列表
-- `POST /api/admin/codes/generate` - 生成激活码
-- `POST /api/admin/codes/delete` - 删除激活码
-- `POST /api/admin/emby/bind` - 绑定Emby服务器
-- `GET /api/admin/stats` - 获取统计数据
-- `GET /api/admin/payment-orders` - 获取支付订单
-- `POST /api/admin/payment-orders/batch-process` - 批量处理订单
-- `GET /api/admin/client-downloads` - 获取客户端列表
-- `POST /api/admin/client-downloads` - 添加客户端
-- `GET /api/admin/tickets` - 获取工单列表
-- `POST /api/admin/tickets/<id>/reply` - 回复工单
-
-### 用户接口
-- `GET /api/user/profile` - 获取个人信息
-- `GET /api/user/history` - 获取观看记录
-- `POST /api/user/sync-history` - 同步观看记录
-- `POST /api/user/renew` - 使用激活码续期
-- `GET /api/user/payment-orders` - 获取支付订单
-- `POST /api/user/payment-orders` - 创建支付订单
-- `POST /api/user/payment-order/<order_no>/refund-qrcode` - 上传退款收款码
-- `GET /api/user/client-downloads` - 获取客户端列表
-- `GET /api/user/tickets` - 获取工单列表
-- `POST /api/user/tickets` - 创建工单
-- `POST /api/user/tickets/<id>/reply` - 回复工单
-
-## 生产环境部署
-
-### 系统要求
-
-- **最低配置**（支持1000并发）：
-  - CPU: 4核
-  - 内存: 8GB
-  - 磁盘: 50GB SSD
-
-- **推荐配置**（支持6000并发）：
-  - CPU: 16核+
-  - 内存: 32GB+
-  - 磁盘: 200GB SSD
-  - 网络: 1Gbps
-
-### 部署步骤
-
-1. **安装依赖**
-```bash
-python start_production.py --install
-```
-
-2. **配置Nginx**（推荐）
-```bash
-# Linux
-sudo cp nginx.conf /etc/nginx/nginx.conf
-sudo systemctl restart nginx
-```
-
-3. **启动服务**
-```bash
-# Windows
-python start_production.py --waitress
-
-# Linux/Mac
-python start_production.py --gunicorn
-```
-
-详细部署文档请参考 [DEPLOYMENT.md](DEPLOYMENT.md)
-
-## 安全特性
-
-- **密码安全**：使用Werkzeug进行密码哈希存储
-- **登录保护**：登录失败5次封禁5分钟
-- **CSRF防护**：表单提交验证CSRF Token
-- **文件上传安全**：扩展名白名单 + 文件魔数校验
-- **SQL注入防护**：使用SQLAlchemy ORM，参数化查询
-- **XSS防护**：模板自动转义，防止跨站脚本攻击
-- **会话安全**：随机SECRET_KEY，会话过期机制
+---
 
 ## 技术栈
 
-- **后端**：Flask + SQLAlchemy + SQLite
-- **前端**：HTML5 + CSS3 + Vanilla JavaScript
-- **样式**：自定义粉色少女心主题
-- **图表**：Chart.js（用于统计数据展示）
-- **服务器**：Waitress(Windows) / Gunicorn(Linux/Mac)
-- **反向代理**：Nginx
+- **后端**：Flask、SQLAlchemy、SQLite、Requests / aiohttp
+- **前端**：Jinja2 + 原生 HTML/CSS/JavaScript、Chart.js、Font Awesome
+- **生产服务器**：Gunicorn（Linux / Docker）、Waitress（Windows）
+- **容器化**：Docker、Docker Compose（python:3.12-slim 基础镜像、非 root 运行、健康检查）
+- **反向代理**：Nginx（可选，见 `nginx.conf`）
+
+---
+
+## 主要接口一览
+
+**认证**：`POST /api/login`、`POST /api/logout`、`POST /api/register`、`POST /api/change-password`
+
+**普通用户**：
+
+- `GET /api/user/profile` 个人信息
+- `GET /api/user/history` 观看历史
+- `GET /api/user/watch-calendar` 看剧日历汇总（**仅有效期内可用**）
+- `GET /api/user/watch-calendar/day?date=YYYY-MM-DD` 某日海报时间线与剧集详情（**仅有效期内可用**）
+- `POST /api/user/renew` 激活码续期，以及金币充值、商城、工单、客户端等接口
+
+**管理员**：`/api/admin/users`、`/api/admin/codes`、`/api/admin/emby/*`、`/api/admin/payment-orders`、`/api/admin/client-downloads`、`/api/admin/tickets` 等。
+
+---
 
 ## 更新日志
 
-### v1.0.0
-- 基础用户管理功能
-- Emby服务器集成
-- 激活码系统
+### v3.1.0（2026-10）
+
+- 🐳 新增 **Docker / Docker Compose 部署**支持：Dockerfile、compose 编排、环境变量模板、健康检查、非 root 运行、数据卷持久化与一键部署脚本（Linux/macOS/Windows）
+- 📅 仪表盘新增**看剧日历**卡片：近 12 个月看剧日程、涂鸦日期标识、当日海报时间线、剧集/电影简介
+- 🔒 看剧日历增加**有效期校验**：过期用户日历锁定并引导续期，接口返回 403
+- 🔧 修复编辑媒体库时不修改内容直接"测试连接"失败的问题（`***` 掩码密钥自动回退为已存储密钥）
+- 📄 服务条款 / 隐私政策页底部新增"返回注册"按钮
+- 👤 修复管理员用户详情弹窗信息空白/固定不变、观看统计图表为假数据的问题，改为真实用户数据与真实观看分类统计
+- 🔑 会话密钥支持通过环境变量 `EMBY_MANAGER_SECRET_KEY` 固定
 
 ### v2.0.0
-- 支付审核系统
-- 客户端下载管理
-- 工单系统
-- 观看记录同步
-- 生产环境优化
 
-## 感谢支持
-<img width="123" height="157" alt="24d2dba27e55124441b990463772d168" src="https://github.com/user-attachments/assets/d019ab6f-26f4-4a80-96af-34a8daf8a7a4" />
+- 支付审核与退款、金币商城、礼品卡
+- 客户端下载管理、工单系统、观看记录每日同步
+- 邮箱验证 / 找回密码、Emby 策略巡查与白名单、WebDAV 分配
+- 生产环境并发优化
 
+### v1.0.0
+
+- 基础用户管理、激活码体系、Emby 服务器绑定
+
+---
+
+## 安全建议
+
+1. 部署后立即修改默认管理员密码
+2. 在 `.env` 中设置高强度的 `EMBY_MANAGER_SECRET_KEY`
+3. 不要将 `*.db`、`.env`、日志与上传文件提交到公开仓库（已提供 `.gitignore` / `.dockerignore`）
+4. 公网暴露建议前置 Nginx 并启用 HTTPS（参考 `nginx.conf` 与 [DEPLOYMENT.md](DEPLOYMENT.md)）
+5. 定期通过数据卷备份数据库
+
+---
 
 ## 许可证
 
-MIT License
-
-## 注意事项
-
-1. 首次运行时会自动创建数据库和默认管理员账号
-2. 建议立即修改默认管理员密码
-3. 绑定Emby服务器后可同步用户状态和观看记录
-4. 系统会每分钟自动检查并禁用到期用户
-5. 每日零时自动同步未过期用户的观看记录
-6. 过期用户无法访问媒体库地址页面和客户端下载页面
+本项目采用 MIT 许可证。

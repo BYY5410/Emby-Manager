@@ -1,0 +1,40 @@
+# ---------- 版本控制 / IDE / Trae ----------
+.git
+.gitignore
+.trae
+.vscode
+.idea
+
+# ---------- Python 缓存 ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---------- 数据库（容器首次启动自动初始化；旧库迁移见 README） ----------
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# ---------- 运行时数据（通过数据卷持久化，不打入镜像） ----------
+logs/*
+cache/*
+sessions/*
+
+# ---------- 用户上传内容 / 大文件（通过数据卷持久化） ----------
+static/downloads/clients/*
+static/uploads/*
+static/images/payment_qrcodes/*
+static/images/refund_qrcodes/*
+
+# ---------- Docker / 环境文件本身 ----------
+Dockerfile
+.dockerignore
+docker-compose.yml
+.env
+docker/data/
+
+# ---------- 日志与临时文件 ----------
+*.log
+*.tmp

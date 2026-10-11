@@ -1,0 +1,40 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# ---------- 环境变量（含密钥，禁止提交） ----------
+.env
+
+# ---------- 数据库（含真实用户与 Emby API 密钥，禁止提交） ----------
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# ---------- 运行时目录 ----------
+logs/*
+cache/*
+sessions/*
+!logs/.gitkeep
+!cache/.gitkeep
+
+# ---------- 用户上传内容 / 大体积文件 ----------
+static/downloads/clients/*
+static/uploads/*
+static/images/payment_qrcodes/*
+static/images/refund_qrcodes/*
+
+# ---------- 日志与临时文件 ----------
+*.log
+*.tmp
+
+# ---------- 操作系统 / 编辑器 ----------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.trae/
