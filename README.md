@@ -88,6 +88,16 @@
 | 普通用户 | 仪表盘（统计卡片、观看趋势、**看剧日历**、最近观看）、观看历史、媒体库、金币充值、套餐商城、客户端下载、使用文档、我的工单、个人信息 |
 | 管理员 | 运营仪表盘、用户管理、激活码管理、绑定媒体库、支付审核、客户端管理、工单管理、系统设置、个人信息 |
 
+<img width="2124" height="1125" alt="image" src="https://github.com/user-attachments/assets/e33fa3ed-cfd6-4b7a-8e60-00e417552d9a" />
+
+<img width="2117" height="1060" alt="image" src="https://github.com/user-attachments/assets/d0b51d4e-a599-4041-b8d2-2cc488d64661" />
+
+<img width="2064" height="1083" alt="image" src="https://github.com/user-attachments/assets/d3be5c75-ab12-48d9-b389-6fcbeccc06d1" />
+
+<img width="2115" height="1152" alt="image" src="https://github.com/user-attachments/assets/7947b297-8398-49ce-8b97-755f18a47083" />
+
+
+
 ---
 
 ## 快速开始（Docker 部署）
