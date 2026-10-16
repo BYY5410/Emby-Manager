@@ -1,3 +1,5 @@
+<img width="300" height="100" alt="logo" src="https://github.com/user-attachments/assets/5a298f8f-1a3d-41bd-b4db-577e00ad61af" />
+
 # Emby Manager · Emby 用户管理系统
 
 ![Python](https://img.shields.io/badge/Python-3.10%20~%203.12-3776AB?logo=python&logoColor=white)
@@ -90,6 +92,14 @@
 | 游客 | 首页、登录、注册（激活码+邮箱验证）、忘记密码、服务条款、隐私政策 |
 | 普通用户 | 仪表盘（统计卡片、观看趋势、**看剧日历**、最近观看）、观看历史、媒体库、金币充值、套餐商城、客户端下载、使用文档、我的工单、个人信息 |
 | 管理员 | 运营仪表盘、用户管理、激活码管理、绑定媒体库、支付管理（渠道绑定 / 充值档位 / 记录审核）、客户端管理、工单管理、系统设置、个人信息 |
+
+<img width="2117" height="1134" alt="image" src="https://github.com/user-attachments/assets/fd4d5ee2-3551-43c8-9483-4d939f570f2f" />
+
+<img width="2131" height="1061" alt="image" src="https://github.com/user-attachments/assets/89f7d849-7ff7-411c-b0a0-816fe76fd21b" />
+
+<img width="2119" height="1084" alt="image" src="https://github.com/user-attachments/assets/575d4685-c58b-4b33-8ae2-1d35899b410d" />
+
+
 
 ---
 
