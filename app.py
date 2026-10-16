@@ -13,16 +13,18 @@ import secrets
 import hashlib
 import requests
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from functools import wraps
 from threading import Thread
 import time
 import contextvars
 from contextlib import contextmanager
 
-from flask import Flask, request, jsonify, session, render_template, redirect, url_for, flash, send_from_directory, send_file
+from flask import Flask, request, jsonify, session, render_template, redirect, url_for, flash, send_from_directory, send_file, Response
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, ForeignKey, Enum, Numeric, and_, or_, func, select, UniqueConstraint
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, ForeignKey, Enum, Numeric, and_, or_, func, select, update, UniqueConstraint
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker, scoped_session
 from functools import lru_cache
@@ -31,6 +33,9 @@ import hashlib
 import pickle
 import threading
 import re
+
+# 支付网关适配层（支付宝当面付/微信Native/易支付/虎皮椒/Stripe/京东/个人收款码）
+import payment_gateways
 
 # ============== HTML净化工具 ==============
 
@@ -262,6 +267,8 @@ class User(Base):
     email_verified = Column(Boolean, default=False)
     emby_access_disabled = Column(Boolean, default=False, nullable=False)  # Emby访问是否因过期被系统自动禁用
     emby_server_id = Column(Integer, ForeignKey('emby_servers.id'), nullable=True, index=True)  # 用户所属的Emby媒体库
+    # 首次登录/脚本重置后是否必须修改密码（默认管理员初始密码等场景）
+    must_change_password = Column(Boolean, default=False, nullable=False, server_default='0')
 
     watch_history = relationship("WatchHistory", back_populates="user", cascade="all, delete-orphan")
     emby_server = relationship("EmbyServer", foreign_keys=[emby_server_id])
@@ -307,7 +314,8 @@ class User(Base):
             'email_verified': self.email_verified,
             'emby_access_disabled': bool(self.emby_access_disabled),
             'emby_server_id': self.emby_server_id,
-            'emby_server_name': self.emby_server.name if self.emby_server else None
+            'emby_server_name': self.emby_server.name if self.emby_server else None,
+            'must_change_password': bool(self.must_change_password)
         }
 
 class ActivationCode(Base):
@@ -764,10 +772,20 @@ class PaymentOrder(Base):
     discount_amount = Column(Numeric(10, 2), nullable=True)  # 优惠金额，保留两位小数
     coupon_id = Column(Integer, ForeignKey('coupon_codes.id'), nullable=True)  # 关联的优惠码ID
 
+    # 支付管理重构：支付渠道关联
+    channel_id = Column(Integer, ForeignKey('payment_channels.id'), nullable=True, index=True)
+    # 第三方渠道流水号（防重复入账用，NULL 不参与唯一冲突）
+    channel_trade_no = Column(String(64), nullable=True)
+    # 是否由渠道回调/查单自动入账
+    auto_paid = Column(Boolean, default=False, nullable=False)
+    # 在线渠道下单返回的支付凭据（二维码串/收银台跳转 URL），仅用于用户支付页展示
+    pay_payload = Column(Text, nullable=True)
+
     user = relationship("User", foreign_keys=[user_id])
     approver = relationship("User", foreign_keys=[approved_by])
     refund_processor = relationship("User", foreign_keys=[refund_processed_by])
     coupon = relationship("CouponCode")
+    channel = relationship("PaymentChannel", foreign_keys=[channel_id])
 
     def to_dict(self):
         return {
@@ -791,8 +809,117 @@ class PaymentOrder(Base):
             'coupon_code': self.coupon_code,
             'original_amount': float(self.original_amount) if self.original_amount is not None else None,
             'discount_amount': float(self.discount_amount) if self.discount_amount is not None else None,
-            'coupon_id': self.coupon_id
+            'coupon_id': self.coupon_id,
+            'channel_id': self.channel_id,
+            'channel_code': self.channel.code if self.channel else None,
+            'channel_name': self.channel.name if self.channel else None,
+            'channel_type': self.channel.type if self.channel else None,
+            'channel_type_label': payment_gateways.CHANNEL_SPEC.get(self.channel.type, {}).get('label')
+                                  if self.channel else None,
+            'channel_icon': _channel_display_icon(
+                self.channel,
+                payment_gateways.CHANNEL_SPEC.get(self.channel.type, {}).get('icon')
+            ) if self.channel else None,
+            'channel_brand': _channel_brand(self.channel) if self.channel else None,
+            'channel_trade_no': self.channel_trade_no,
+            'auto_paid': bool(self.auto_paid),
+            'online': bool(payment_gateways.CHANNEL_SPEC.get(self.channel.type, {}).get('supports_notify'))
+                      if self.channel else False,
+            'channel_qrcode_url': ('/' + self.channel.qrcode_path.replace('\\', '/'))
+                                  if (self.channel and self.channel.qrcode_path) else None
         }
+
+class PaymentChannel(Base):
+    """支付渠道表（个人收款码 / 官方或第三方支付网关）"""
+    __tablename__ = 'payment_channels'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # 英文唯一标识，用于回调地址 /api/payment/notify/<code>
+    code = Column(String(50), unique=True, nullable=False, index=True)
+    name = Column(String(100), nullable=False)  # 前台显示名称
+    # static_qrcode / alipay_f2f / wechat_native / epay / hupijiao / stripe / jd
+    type = Column(String(30), nullable=False)
+    # 敏感凭证 JSON（APPID/商户号/私钥/密钥等），Fernet 加密后存储
+    credentials_encrypted = Column(Text, nullable=True)
+    # 非敏感配置 JSON（网关地址、备注等）
+    config_json = Column(Text, nullable=True)
+    # 个人收款码图片相对路径（仅 static_qrcode 使用）
+    qrcode_path = Column(String(255), nullable=True)
+    is_active = Column(Boolean, default=True, nullable=False)
+    sort_order = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+    def get_config(self):
+        if not self.config_json:
+            return {}
+        try:
+            data = json.loads(self.config_json)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def set_config(self, data):
+        self.config_json = json.dumps(data or {}, ensure_ascii=False)
+
+    def get_credentials(self):
+        """解密凭证（仅服务端调用，禁止进入任何响应）"""
+        if not self.credentials_encrypted:
+            return {}
+        try:
+            f = _get_fernet()
+            raw = f.decrypt(self.credentials_encrypted.encode()).decode() if f else self.credentials_encrypted
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def set_credentials(self, data):
+        raw = json.dumps(data or {}, ensure_ascii=False)
+        f = _get_fernet()
+        self.credentials_encrypted = f.encrypt(raw.encode()).decode() if f else raw
+
+    def to_dict(self, include_credentials=False):
+        """默认不返回任何凭证内容"""
+        return {
+            'id': self.id,
+            'code': self.code,
+            'name': self.name,
+            'type': self.type,
+            'config': self.get_config(),
+            'qrcode_path': self.qrcode_path,
+            'qrcode_url': ('/' + self.qrcode_path.replace('\\', '/')) if self.qrcode_path else None,
+            'is_active': bool(self.is_active),
+            'sort_order': self.sort_order,
+            'has_credentials': bool(self.credentials_encrypted),
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+
+class RechargeTier(Base):
+    """充值档位表（管理员自定义：支付金额 -> 到账金币）"""
+    __tablename__ = 'recharge_tiers'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), nullable=False)
+    amount_yuan = Column(Numeric(10, 2), nullable=False)  # 支付金额（元）
+    coin_amount = Column(Integer, nullable=False)  # 到账金币
+    is_active = Column(Boolean, default=True, nullable=False)
+    sort_order = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'amount_yuan': float(self.amount_yuan) if self.amount_yuan is not None else None,
+            'coin_amount': self.coin_amount,
+            'is_active': bool(self.is_active),
+            'sort_order': self.sort_order,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
 
 class SubscriptionRecord(Base):
     """开通套餐记录表"""
@@ -1476,6 +1603,12 @@ def init_db():
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_users_emby_server_id ON users (emby_server_id)"))
         logger.info("数据库迁移：添加 users.emby_server_id 列")
 
+    # 添加 must_change_password 列（首次登录强制改密）
+    if 'must_change_password' not in columns:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT 0"))
+        logger.info("数据库迁移：添加 users.must_change_password 列")
+
     # 删除旧的列（如果存在）
     if 'is_manually_disabled' in columns:
         # SQLite 不支持直接删除列，需要重建表
@@ -1684,6 +1817,26 @@ def init_db():
                 conn.execute(text("ALTER TABLE payment_orders ADD COLUMN discount_amount NUMERIC(10, 2)"))
                 conn.execute(text("ALTER TABLE payment_orders ADD COLUMN coupon_id INTEGER"))
             logger.info("数据库迁移：添加 payment_orders 优惠码相关列")
+        # 支付管理重构：渠道关联列
+        if 'channel_id' not in payment_columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE payment_orders ADD COLUMN channel_id INTEGER"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_payment_orders_channel_id ON payment_orders (channel_id)"))
+            logger.info("数据库迁移：添加 payment_orders.channel_id 列")
+        if 'channel_trade_no' not in payment_columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE payment_orders ADD COLUMN channel_trade_no VARCHAR(64)"))
+                # SQLite 唯一索引允许多个 NULL：第三方流水号防重放，仅对已回填订单生效
+                conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_payment_orders_channel_trade_no ON payment_orders (channel_trade_no)"))
+            logger.info("数据库迁移：添加 payment_orders.channel_trade_no 列")
+        if 'auto_paid' not in payment_columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE payment_orders ADD COLUMN auto_paid BOOLEAN NOT NULL DEFAULT 0"))
+            logger.info("数据库迁移：添加 payment_orders.auto_paid 列")
+        if 'pay_payload' not in payment_columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE payment_orders ADD COLUMN pay_payload TEXT"))
+            logger.info("数据库迁移：添加 payment_orders.pay_payload 列")
 
     db = DBSession()
     try:
@@ -1695,10 +1848,17 @@ def init_db():
                 password_hash=generate_password_hash('123'),
                 role=UserRole.ADMIN,
                 is_active=True,
-                expiry_date=None
+                expiry_date=None,
+                must_change_password=True  # 默认初始密码，首次登录强制修改
             )
             db.add(admin)
-            logger.info("创建默认管理员账号: admin / 123")
+            logger.info("创建默认管理员账号: admin / 123（首次登录需强制修改密码）")
+        else:
+            # 存量管理员若仍在使用默认密码 123，标记为首次登录必须修改
+            if admin.role == UserRole.ADMIN and not admin.must_change_password \
+                    and check_password_hash(admin.password_hash, '123'):
+                admin.must_change_password = True
+                logger.info("检测到管理员仍使用初始密码，已标记首次登录强制修改")
         
         # 初始化系统配置
         configs = [
@@ -1706,6 +1866,9 @@ def init_db():
             ('emby_api_key', ''),
             ('site_name', 'Emby Manager'),
             ('register_enabled', 'true'),
+            # 支付管理默认开关（保持现行行为：人工审核开、自定义金额开）
+            ('payment_manual_review', 'on'),
+            ('payment_custom_amount_enabled', 'on'),
         ]
         for key, value in configs:
             existing = db.query(SystemConfig).filter_by(key=key).first()
@@ -1764,6 +1927,9 @@ def init_db():
             if unassigned:
                 logger.info(f"多库迁移：已将 {len(unassigned)} 个存量用户回填到媒体库 {first_server.name}")
 
+        # 支付管理：默认渠道与充值档位种子（幂等）
+        _seed_payment_defaults(db)
+
         db.commit()
         logger.info("数据库初始化完成")
     except Exception as e:
@@ -1776,9 +1942,42 @@ def init_db():
 app = Flask(__name__, 
             template_folder='templates',
             static_folder='static')
-app.secret_key = os.environ.get('EMBY_MANAGER_SECRET_KEY') or secrets.token_hex(32)
+def _load_secret_key():
+    """会话签名密钥：优先环境变量；否则持久化到本地文件，避免每次重启导致全部会话失效。
+    本地文件自动生成并尽量收紧权限，切勿提交到代码仓库。"""
+    env_key = os.environ.get('EMBY_MANAGER_SECRET_KEY')
+    if env_key:
+        return env_key
+    key_dir = os.path.join(BASE_DIR, 'instance')
+    key_file = os.path.join(key_dir, 'secret_key')
+    try:
+        if os.path.exists(key_file):
+            with open(key_file, 'r', encoding='utf-8') as f:
+                saved = f.read().strip()
+            if saved:
+                return saved
+        os.makedirs(key_dir, exist_ok=True)
+        new_key = secrets.token_hex(32)
+        with open(key_file, 'w', encoding='utf-8') as f:
+            f.write(new_key)
+        try:
+            os.chmod(key_file, 0o600)
+        except OSError:
+            pass
+        return new_key
+    except Exception as e:
+        logger.warning(f"持久化会话密钥失败，回退为进程内随机密钥: {e}")
+        return secrets.token_hex(32)
+
+
+app.secret_key = _load_secret_key()
 app.config['SESSION_TYPE'] = 'filesystem'
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)
+# 会话 Cookie 安全加固：HttpOnly 防 JS 读取；SameSite=Lax 阻断跨站 POST 携带 Cookie（缓解 CSRF）。
+# 全站 HTTPS 部署时请设置环境变量 EMBY_COOKIE_SECURE=1 以启用 Secure 标记。
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get('EMBY_COOKIE_SECURE', '') == '1'
 
 # 登录失败限制配置
 login_attempts = {}  # 记录登录尝试
@@ -1793,6 +1992,14 @@ PASSWORD_CHANGE_HOUR_LIMIT = 5  # 1小时内最大修改次数
 PASSWORD_CHANGE_IP_MINUTES = 10  # IP检测时间窗口（分钟）
 PASSWORD_CHANGE_IP_USER_LIMIT = 3  # 同一IP在时间内最大不同用户数
 PASSWORD_CHANGE_FAILURE_LIMIT = 3  # 连续失败次数限制
+
+# 邮件验证码安全限制（单实例内存表，waitress 多线程共享）
+email_code_ip_sends = {}  # {ip: [timestamp, ...]} 同一 IP 发送频率
+EMAIL_CODE_IP_WINDOW = 3600  # IP 限流窗口：1 小时
+EMAIL_CODE_IP_MAX = 20  # 同一 IP 每小时最多发送 20 封（兼顾内网 NAT 多用户）
+forgot_code_failures = {}  # {email: [timestamp, ...]} 忘记密码验证码连续校验失败
+FORGOT_CODE_IP_WINDOW = 600  # 失败统计窗口：10 分钟
+FORGOT_CODE_MAX_FAILURES = 5  # 10 分钟内最多失败 5 次（6 位验证码不可爆破）
 
 # Emby用户策略巡查相关内存数据结构
 emby_policy_snapshots = {}  # {emby_user_id: {'policy_hash': str, 'timestamp': datetime, 'policy_data': dict}}
@@ -1830,6 +2037,35 @@ def add_cache_control(response):
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '0'
     return response
+
+# 首次登录强制改密期间，仅允许以下写请求（页面加载类 GET 不受影响，保证弹窗可正常展示）
+FORCE_CHANGE_PASSWORD_ALLOWED_PATHS = {
+    '/api/change-password', '/api/change-username', '/api/logout', '/logout', '/auth/logout',
+}
+
+
+@app.before_request
+def enforce_must_change_password():
+    """被标记 must_change_password 的账户（默认初始密码管理员等），
+    在完成改密前禁止一切写操作，从服务端保证强制改密不是可绕过的软提示。"""
+    if request.method in ('GET', 'HEAD', 'OPTIONS'):
+        return None
+    user_id = session.get('user_id')
+    if not user_id or request.path in FORCE_CHANGE_PASSWORD_ALLOWED_PATHS:
+        return None
+    db = get_db()
+    try:
+        user = db.query(User).get(user_id)
+        if user is not None and user.must_change_password:
+            logger.warning(f"账户 {user.username} 在强制改密前尝试写操作: {request.path}")
+            return jsonify({
+                'success': False,
+                'code': 'must_change_password',
+                'message': '请先修改初始密码后再进行其他操作'
+            }), 403
+    finally:
+        db.close()
+    return None
 
 # CSRF保护 - 生成和验证token
 def generate_csrf_token():
@@ -2355,6 +2591,39 @@ def set_config(key, value):
     finally:
         db.close()
 
+
+def _seed_payment_defaults(db):
+    """支付管理默认种子（幂等）：2 个个人收款码渠道（沿用现存收款码图片）+ 6 个充值档位。
+    仅在对应表为空时插入，管理员删除后的自定义结果不会被反复覆盖。"""
+    if db.query(PaymentChannel).count() == 0:
+        static_seeds = [
+            ('alipay_qr', '支付宝（个人收款码）', 'alipay', 0),
+            ('wechat_qr', '微信（个人收款码）', 'wechat', 1),
+        ]
+        for code, name, sub, sort in static_seeds:
+            qr_path = None
+            qr_dir = os.path.join(BASE_DIR, 'static', 'images', 'payment_qrcodes', sub)
+            if os.path.isdir(qr_dir):
+                files = sorted(
+                    f for f in os.listdir(qr_dir)
+                    if f.lower().endswith(('.png', '.jpg', '.jpeg', '.gif'))
+                )
+                if files:
+                    qr_path = os.path.join('static', 'images', 'payment_qrcodes', sub, files[0])
+            db.add(PaymentChannel(
+                code=code, name=name, type='static_qrcode',
+                qrcode_path=qr_path, is_active=True, sort_order=sort
+            ))
+        logger.info("支付管理种子：创建默认个人收款码渠道")
+
+    if db.query(RechargeTier).count() == 0:
+        for idx, amt in enumerate([10, 50, 100, 200, 500, 1000]):
+            db.add(RechargeTier(
+                name=f'{amt}元档位', amount_yuan=amt, coin_amount=amt,
+                is_active=True, sort_order=idx
+            ))
+        logger.info("支付管理种子：创建默认充值档位")
+
 # ============== Emby API 集成 ==============
 # 当前线程/协程正在操作的Emby媒体库ID（多库支持）
 _emby_server_ctx = contextvars.ContextVar('emby_server_ctx', default=None)
@@ -2741,8 +3010,8 @@ class EmbyAPI:
                     }
                     
                     logger.info(f"请求URL: {password_url}")
-                    logger.info(f"请求数据: {password_data}")
-                    
+                    # 请求体包含明文新密码，禁止写入日志
+
                     password_response = requests.post(password_url, headers=headers, json=password_data, timeout=10)
                     
                     logger.info(f"方法2响应: HTTP {password_response.status_code}")
@@ -5271,7 +5540,6 @@ def api_login():
             return jsonify({'success': False, 'message': '用户名或密码错误'}), 401
 
         password_match = check_password_hash(user.password_hash, password)
-        logger.info(f"登录验证 - 用户名: {username}, 存储的哈希前50位: {user.password_hash[:50]}..., 密码匹配: {password_match}")
 
         if not password_match:
             # 记录登录失败（先记录到内存，确保即使数据库失败也能限制）
@@ -5314,12 +5582,16 @@ def api_login():
         
         # 检查是否过期 - 过期用户允许登录但只能续期
         is_expired = user.is_expired()
-        
+
+        # 登录成功先清空旧会话再重新写入（防 Session Fixation 会话固定攻击）
+        session.clear()
         session.permanent = True
         session['user_id'] = user.id
         session['username'] = user.username
         session['role'] = user.role.value
-        
+        # clear 后重新生成 CSRF token，供登录后页面使用
+        generate_csrf_token()
+
         if is_expired:
             logger.info(f"过期用户登录: {username}")
             return jsonify({
@@ -5330,7 +5602,8 @@ def api_login():
                     'username': user.username,
                     'role': user.role.value,
                     'is_expired': True,
-                    'require_renew': True
+                    'require_renew': True,
+                    'must_change_password': bool(user.must_change_password)
                 }
             })
         
@@ -5343,7 +5616,8 @@ def api_login():
                 'id': user.id,
                 'username': user.username,
                 'role': user.role.value,
-                'is_expired': False
+                'is_expired': False,
+                'must_change_password': bool(user.must_change_password)
             }
         })
     finally:
@@ -5452,10 +5726,10 @@ def api_change_password():
 
         # 生成新密码哈希
         new_hash = generate_password_hash(new_password)
-        logger.info(f"准备更新密码 - 用户名: {username}, 旧哈希前50位: {user.password_hash[:50]}..., 新哈希前50位: {new_hash[:50]}...")
 
-        # 更新密码并提交
+        # 更新密码并提交；同时清除"首次登录强制改密"标记
         user.password_hash = new_hash
+        user.must_change_password = False
         db.commit()
         logger.info(f"本地密码修改成功并已提交到数据库: {username}")
     except Exception as e:
@@ -5474,10 +5748,8 @@ def api_change_password():
             logger.error(f"验证失败 - 用户不存在: {user_id}")
             return jsonify({'success': False, 'message': '验证失败'}), 500
         
-        logger.info(f"数据库验证 - 提交后的密码哈希前50位: {user_check.password_hash[:50]}...")
         verify_result = check_password_hash(user_check.password_hash, new_password)
-        logger.info(f"密码验证测试 - 使用新密码验证: {verify_result}")
-        
+
         if not verify_result:
             logger.error(f"密码验证失败 - 新密码无法通过验证: {username}")
             return jsonify({'success': False, 'message': '密码修改后验证失败'}), 500
@@ -5543,6 +5815,78 @@ def api_change_password():
     
     logger.info(f"用户修改密码完成: {username}")
     return jsonify({'success': True, 'message': message})
+
+
+# 用户名规则与注册保持一致：3-20 位，仅允许中英文、数字、下划线、连字符
+USERNAME_PATTERN = re.compile(r'^[A-Za-z0-9_\-\u4e00-\u9fa5]{3,20}$')
+
+
+@app.route('/api/change-username', methods=['POST'])
+@login_required
+def api_change_username():
+    """当前登录用户自助修改用户名（管理员在个人信息页使用，普通用户接口同样适配）"""
+    data = request.get_json(silent=True) or {}
+
+    # 与修改密码一致，校验 CSRF token
+    token = data.get('csrf_token', '')
+    if not verify_csrf_token(token):
+        return jsonify({'success': False, 'message': '页面已过期，请刷新后重试'}), 400
+
+    new_username = (data.get('new_username') or '').strip()
+    if not new_username:
+        return jsonify({'success': False, 'message': '请输入新用户名'}), 400
+    if not USERNAME_PATTERN.match(new_username):
+        return jsonify({'success': False, 'message': '用户名须为 3-20 位，支持中英文、数字、下划线或连字符'}), 400
+
+    db = get_db()
+    try:
+        user_id = session['user_id']
+        user = db.query(User).get(user_id)
+        if not user:
+            session.clear()
+            return jsonify({'success': False, 'message': '用户不存在'}), 400
+
+        old_username = user.username
+        if new_username == old_username:
+            return jsonify({'success': False, 'message': '新用户名与当前用户名相同'}), 400
+
+        # 唯一性校验
+        exists = db.query(User.id).filter(User.username == new_username).first()
+        if exists:
+            return jsonify({'success': False, 'message': '该用户名已被占用，请更换'}), 400
+
+        user.username = new_username
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"修改用户名失败: {e}")
+        return jsonify({'success': False, 'message': '修改失败'}), 500
+    finally:
+        db.close()
+
+    # 同步会话中的用户名，避免页面显示旧名称
+    session['username'] = new_username
+    try:
+        login_log = LoginLog(
+            user_id=session['user_id'],
+            ip_address=request.remote_addr or '',
+            login_time=datetime.now(),
+            user_agent=request.user_agent.string if request.user_agent else '',
+            success=1
+        )
+        db = get_db()
+        db.add(login_log)
+        db.commit()
+        db.close()
+    except Exception as e:
+        logger.warning(f"记录用户名修改日志失败: {e}")
+
+    logger.info(f"用户名修改成功: {old_username} -> {new_username}")
+    return jsonify({
+        'success': True,
+        'message': '用户名修改成功',
+        'data': {'username': new_username}
+    })
 
 @app.route('/api/login-logs', methods=['GET'])
 @login_required
@@ -5682,7 +6026,8 @@ def api_check_session():
                 'username': user.username,
                 'role': user.role.value,
                 'is_active': user.is_active,
-                'is_expired': user.is_expired()
+                'is_expired': user.is_expired(),
+                'must_change_password': bool(user.must_change_password)
             }
         })
     finally:
@@ -5732,12 +6077,7 @@ def api_register():
             # 检查邮箱是否已被注册
             if db.query(User).filter_by(email=email).first():
                 return jsonify({'success': False, 'message': '该邮箱已被注册'}), 400
-            
-            # 调试：记录收到的验证码信息
-            logger.info(f"=== 邮箱注册调试信息 ===")
-            logger.info(f"收到的邮箱: {repr(email)}")
-            logger.info(f"收到的验证码: {repr(email_code)}")
-            
+
             # 验证邮箱验证码
             verification = db.query(EmailVerificationCode).filter(
                 EmailVerificationCode.email == email,
@@ -5748,18 +6088,8 @@ def api_register():
             ).order_by(EmailVerificationCode.created_at.desc()).first()
             
             if not verification:
-                # 调试：查找是否有任何匹配的记录
-                all_codes = db.query(EmailVerificationCode).filter(
-                    EmailVerificationCode.email == email,
-                    EmailVerificationCode.purpose == 'register'
-                ).order_by(EmailVerificationCode.created_at.desc()).all()
-                
-                logger.info(f"找到的验证码记录数: {len(all_codes)}")
-                for vc in all_codes:
-                    logger.info(f"  记录: code={repr(vc.code)}, is_used={vc.is_used}, expires_at={vc.expires_at}, now={datetime.now()}, expired={vc.expires_at <= datetime.now()}")
-                
                 return jsonify({'success': False, 'message': '邮箱验证码无效或已过期'}), 400
-            
+
             logger.info(f"验证码验证成功: {email}")
             
             # 邮箱注册用户默认过期（需要后续激活）
@@ -8825,11 +9155,67 @@ def api_admin_active_sessions():
     finally:
         db.close()
 
+# ========== 支付管理（原支付审核，拆分为三个子页面 + 初始化引导）==========
+def _payment_init_done():
+    return get_config('payment_initialized', '0') == '1'
+
+def _payment_setup_bypass():
+    """初始化引导期间，允许通过 ?setup=1 进入子页面完成配置"""
+    return request.args.get('setup') == '1'
+
+@app.route('/admin/payment')
+@admin_required
+def admin_payment_entry():
+    return redirect('/admin/payment/channels')
+
+@app.route('/admin/payment/channels')
+@admin_required
+def admin_payment_channels():
+    """支付管理 - 支付方式绑定及设置"""
+    if not _payment_init_done() and not _payment_setup_bypass():
+        return redirect('/admin/payment/init')
+    return render_template('admin/payment/channels.html',
+                           active_menu='payment', active_sub='channels',
+                           setup_mode=not _payment_init_done(),
+                           cache_buster=int(time.time()))
+
+@app.route('/admin/payment/tiers')
+@admin_required
+def admin_payment_tiers():
+    """支付管理 - 充值管理"""
+    if not _payment_init_done() and not _payment_setup_bypass():
+        return redirect('/admin/payment/init')
+    return render_template('admin/payment/tiers.html',
+                           active_menu='payment', active_sub='tiers',
+                           setup_mode=not _payment_init_done(),
+                           cache_buster=int(time.time()))
+
+@app.route('/admin/payment/orders')
+@admin_required
+def admin_payment_orders():
+    """支付管理 - 支付记录及审核"""
+    if not _payment_init_done() and not _payment_setup_bypass():
+        return redirect('/admin/payment/init')
+    return render_template('admin/payment/orders.html',
+                           active_menu='payment', active_sub='orders',
+                           setup_mode=not _payment_init_done(),
+                           cache_buster=int(time.time()))
+
+@app.route('/admin/payment/init')
+@admin_required
+def admin_payment_init():
+    """支付管理 - 首次访问初始化引导"""
+    if _payment_init_done():
+        return redirect('/admin/payment/channels')
+    return render_template('admin/payment/init.html',
+                           active_menu='payment', active_sub='init',
+                           cache_buster=int(time.time()))
+
+# 兼容旧地址：支付审核 → 支付记录及审核
 @app.route('/admin/payment-audit')
 @admin_required
 def admin_payment_audit():
-    """管理员支付审核页面"""
-    return render_template('admin/payment_audit.html', cache_buster=int(time.time()))
+    return redirect('/admin/payment/orders')
 
 @app.route('/admin/users')
 @admin_required
@@ -8939,10 +9325,12 @@ def api_admin_grant_coins():
                     db.add(user_coin)
                     db.flush()
                 
-                # 增加用户金币余额
-                user_coin.balance += amount
-                user_coin.total_recharged += amount
-                
+                # 原子增加用户金币余额（UPDATE SET balance=balance+?，防并发丢失更新）
+                db.query(UserCoin).filter_by(user_id=uid).update({
+                    UserCoin.balance: UserCoin.balance + amount,
+                    UserCoin.total_recharged: UserCoin.total_recharged + amount,
+                }, synchronize_session=False)
+
                 # 同时更新 User.coins
                 user.coins += amount
                 
@@ -10907,13 +11295,19 @@ def api_purchase_package():
             db.add(user_coin)
             db.commit()
 
-        # 检查金币是否足够
-        if user_coin.balance < package.coin_amount:
-            return jsonify({'success': False, 'message': '金币余额不足'}), 400
-
-        # 扣除金币
-        user_coin.balance -= package.coin_amount
-        user_coin.total_spent += package.coin_amount
+        # 原子条件扣币：仅当余额足够时扣减（UPDATE ... WHERE balance >= ?），
+        # 防止并发下单双花以及 read-modify-write 竞态导致余额为负
+        cost = package.coin_amount
+        deducted = db.query(UserCoin).filter(
+            UserCoin.user_id == session['user_id'],
+            UserCoin.balance >= cost
+        ).update({
+            UserCoin.balance: UserCoin.balance - cost,
+            UserCoin.total_spent: UserCoin.total_spent + cost,
+        }, synchronize_session=False)
+        if not deducted:
+            return jsonify({'success': False, 'message': '金币余额不足或订单处理中，请稍后重试'}), 400
+        db.refresh(user_coin)
 
         user = db.query(User).get(session['user_id'])
 
@@ -11056,114 +11450,469 @@ def api_purchase_package():
     finally:
         db.close()
 
-# 创建支付订单（新支付流程）- 使用 /api/user/payment-orders 避免与 /api/user/payment-order/<order_no> 冲突
+# ================= 支付链路：计价 / 发币 / 回调 / 查单 =================
+
+# 自定义金额上下限
+CUSTOM_AMOUNT_MIN = Decimal('1.00')
+CUSTOM_AMOUNT_MAX = Decimal('5000.00')
+# 渠道主动查单简单节流（单实例内存表，order_no -> 上次查询时间戳）
+_last_order_query = {}
+
+
+def _grant_recharge_coins(db, order, admin_id=None, auto=False):
+    """充值订单发金币（人工审核/回调自动入账共用，调用方负责 commit/rollback）。
+
+    所有状态流转/余额变动均使用条件 UPDATE（CAS），保证：
+    1) 同一订单在并发回调、并发审核下只会成功入账一次（paid/pending -> approved）；
+    2) 优惠码占用次数不会因并发丢失更新或超额使用；
+    3) 金币账户走数据库原子加币，无 read-modify-write 竞态。
+    返回：granted 成功入账 / already 订单已入账 / coupon_exhausted 优惠码已不可用。
+    """
+    now = datetime.now()
+    coin_amount = int(order.coin_amount or 0)
+
+    # 1) 先原子占用优惠码名额（含停用/超量判断）；失败则整笔不入账，由调用方回滚
+    if order.coupon_id and order.coupon_code:
+        claimed = db.query(CouponCode).filter(
+            CouponCode.id == order.coupon_id,
+            CouponCode.is_active.is_(True),
+            CouponCode.current_uses < CouponCode.max_uses
+        ).update({CouponCode.current_uses: CouponCode.current_uses + 1},
+                 synchronize_session=False)
+        if not claimed:
+            return 'coupon_exhausted'
+
+    # 2) CAS 入账：仅当订单仍为 paid（人工审核路径）
+    grant_fields = {
+        'status': 'approved',
+        'approved_at': now,
+        'approved_by': admin_id,
+        'auto_paid': bool(auto),
+    }
+    updated = db.query(PaymentOrder).filter(
+        PaymentOrder.order_no == order.order_no,
+        PaymentOrder.status == 'paid'
+    ).update(grant_fields, synchronize_session=False)
+
+    # 3) 自动入账路径允许 pending -> approved（回调首次到达、用户尚未点"已支付"）
+    if not updated and auto:
+        auto_fields = dict(grant_fields)
+        auto_fields['paid_at'] = now
+        updated = db.query(PaymentOrder).filter(
+            PaymentOrder.order_no == order.order_no,
+            PaymentOrder.status == 'pending'
+        ).update(auto_fields, synchronize_session=False)
+
+    if not updated:
+        # 并发竞争失败：订单已被另一路回调/审核处理
+        return 'already'
+
+    # 4) 金币账户原子加币（SET balance = balance + ?）
+    existing_coin = db.query(UserCoin.id).filter_by(user_id=order.user_id).first()
+    if existing_coin:
+        db.query(UserCoin).filter_by(user_id=order.user_id).update({
+            UserCoin.balance: UserCoin.balance + coin_amount,
+            UserCoin.total_recharged: UserCoin.total_recharged + coin_amount,
+        }, synchronize_session=False)
+    else:
+        db.add(UserCoin(user_id=order.user_id, balance=coin_amount,
+                        total_recharged=coin_amount, total_spent=0))
+
+    reason = (f'充值订单 {order.order_no} 支付回调自动入账' if auto
+              else f'充值订单 {order.order_no} 审核通过')
+    db.add(CoinTransaction(
+        user_id=order.user_id, amount=coin_amount, type='recharge',
+        reason=reason, created_by=admin_id))
+
+    # 优惠码使用记录（与原审核逻辑一致）
+    if order.coupon_id and order.coupon_code:
+        db.add(CouponUsageRecord(
+            coupon_id=order.coupon_id, user_id=order.user_id,
+            order_no=order.order_no,
+            original_amount=order.original_amount or order.amount,
+            discount_amount=order.discount_amount or 0,
+            final_amount=order.amount, used_at=now))
+        logger.info("优惠码 %s 被使用，订单 %s，优惠金额 %s 元",
+                    order.coupon_code, order.order_no, order.discount_amount)
+
+    # 使 ORM 实例过期，后续访问会重新读取 CAS 后的真实状态
+    db.expire(order)
+    return 'granted'
+
+
+def _apply_channel_payment(db, order, trade_no, auto_grant):
+    """渠道确认收款后的幂等状态机。返回 already/granted/waiting/ignored/coupon_exhausted。
+    状态流转全部使用条件 UPDATE，杜绝并发回调/审核下的重复发币。"""
+    if order.status == 'approved':
+        return 'already'
+    if trade_no and not order.channel_trade_no:
+        order.channel_trade_no = str(trade_no)[:64]
+    if order.status not in ('pending', 'paid'):
+        return 'ignored'
+    if not auto_grant:
+        # 人工审核模式：渠道已收款，pending -> paid（CAS，重复回调幂等）
+        if order.status == 'pending':
+            updated = db.query(PaymentOrder).filter(
+                PaymentOrder.order_no == order.order_no,
+                PaymentOrder.status == 'pending'
+            ).update({'status': 'paid', 'paid_at': datetime.now()},
+                     synchronize_session=False)
+            if updated:
+                db.expire(order)
+        return 'waiting'
+    # 自动入账模式：CAS 发币
+    return _grant_recharge_coins(db, order, admin_id=None, auto=True)
+
+
+# 普通用户：可用支付渠道（仅启用）
+@app.route('/api/payment/channels', methods=['GET'])
+@login_required
+def api_public_payment_channels():
+    db = get_db()
+    try:
+        channels = db.query(PaymentChannel).filter_by(is_active=True).order_by(
+            PaymentChannel.sort_order.asc(), PaymentChannel.id.asc()).all()
+        result = []
+        for ch in channels:
+            spec = payment_gateways.CHANNEL_SPEC.get(ch.type, {})
+            result.append({
+                'code': ch.code,
+                'name': ch.name,
+                'type': ch.type,
+                'type_label': spec.get('label', ch.type),
+                'brand': _channel_brand(ch),
+                'icon': _channel_display_icon(ch, spec.get('icon')),
+                'online': bool(spec.get('supports_notify')),
+                'qrcode_url': ('/' + ch.qrcode_path.replace('\\', '/'))
+                              if ch.qrcode_path else None,
+            })
+        return jsonify({'success': True, 'data': result})
+    finally:
+        db.close()
+
+
+# 普通用户：启用充值档位
+@app.route('/api/recharge-tiers', methods=['GET'])
+@login_required
+def api_public_recharge_tiers():
+    db = get_db()
+    try:
+        tiers = db.query(RechargeTier).filter_by(is_active=True).order_by(
+            RechargeTier.sort_order.asc(), RechargeTier.id.asc()).all()
+        return jsonify({'success': True, 'data': [t.to_dict() for t in tiers]})
+    finally:
+        db.close()
+
+
+# 普通用户：充值中心公开设置（只含可公开的开关）
+@app.route('/api/payment/settings/public', methods=['GET'])
+@login_required
+def api_public_payment_settings():
+    return jsonify({'success': True, 'data': {
+        'custom_amount_enabled': get_config('payment_custom_amount_enabled', 'on') == 'on',
+        'manual_review': get_config('payment_manual_review', 'on') == 'on',
+        'custom_min': float(CUSTOM_AMOUNT_MIN),
+        'custom_max': float(CUSTOM_AMOUNT_MAX),
+    }})
+
+
+# 创建支付订单 - 金额/金币一律服务端计算，忽略任何客户端 coin 字段（防篡改）
 @app.route('/api/user/payment-orders', methods=['POST'])
 @login_required
 def api_create_payment_order():
-    """创建支付订单"""
+    """创建支付订单（档位/自定义金额 + 静态码/API 渠道）"""
     try:
-        data = request.get_json()
-        logger.info(f"创建支付订单 - 接收到的数据: {data}")
-        
-        if not data:
-            return jsonify({'success': False, 'message': '请求数据无效'}), 400
-        
-        amount = data.get('amount')
-        payment_method = data.get('payment_method', 'alipay')
-        coupon_code = data.get('coupon_code', '').strip()
-        
-        logger.info(f"创建支付订单 - 金额: {amount}, 支付方式: {payment_method}, 优惠码: {coupon_code}")
-        
-        if not amount or amount <= 0:
-            return jsonify({'success': False, 'message': '充值金额无效'}), 400
-        
-        if payment_method not in ['wechat', 'alipay']:
-            return jsonify({'success': False, 'message': '支付方式无效'}), 400
-    except Exception as e:
-        logger.error(f"创建支付订单 - 解析请求数据失败: {e}")
+        data = request.get_json(silent=True) or {}
+        channel_code = (data.get('channel_code') or '').strip().lower()
+        # 兼容旧版前端 payment_method=alipay/wechat
+        if not channel_code and data.get('payment_method') in ('alipay', 'wechat'):
+            channel_code = data.get('payment_method') + '_qr'
+        tier_id = data.get('tier_id')
+        custom_amount = data.get('amount')
+        coupon_code = (data.get('coupon_code') or '').strip()
+
+        if data.get('coin_amount') is not None:
+            logger.warning("订单请求携带客户端 coin_amount 字段，已忽略（用户 %s）",
+                           session.get('user_id'))
+    except Exception:
         return jsonify({'success': False, 'message': '请求数据格式错误'}), 400
-    
+
     db = get_db()
+    # get_config 会关闭线程共享会话，须在加载 ORM 对象前读取
+    custom_amount_enabled = get_config('payment_custom_amount_enabled', 'on') == 'on'
     try:
-        # 处理优惠码
-        original_amount = amount
-        discount_amount = 0
+        channel = db.query(PaymentChannel).filter_by(code=channel_code).first()
+        if not channel or not channel.is_active:
+            return jsonify({'success': False, 'message': '支付方式不可用'}), 400
+        gateway = payment_gateways.get_gateway(channel.type)
+        if gateway is None:
+            return jsonify({'success': False, 'message': '支付方式配置异常'}), 400
+
+        # ---- 服务端定价 ----
+        if tier_id not in (None, '', 0):
+            try:
+                tier_id = int(tier_id)
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'message': '充值档位无效'}), 400
+            tier = db.query(RechargeTier).filter_by(id=tier_id, is_active=True).first()
+            if not tier:
+                return jsonify({'success': False, 'message': '充值档位不存在或已停用'}), 400
+            base_amount = Decimal(tier.amount_yuan).quantize(Decimal('0.01'))
+            coin_amount = int(tier.coin_amount)
+        else:
+            if not custom_amount_enabled:
+                return jsonify({'success': False, 'message': '当前仅支持选择固定充值档位'}), 400
+            try:
+                base_amount = Decimal(str(custom_amount)).quantize(Decimal('0.01'))
+            except (InvalidOperation, ValueError, TypeError):
+                return jsonify({'success': False, 'message': '充值金额无效'}), 400
+            if not (CUSTOM_AMOUNT_MIN <= base_amount <= CUSTOM_AMOUNT_MAX):
+                return jsonify({
+                    'success': False,
+                    'message': '自定义金额需在 %.0f ~ %.0f 元之间' % (
+                        CUSTOM_AMOUNT_MIN, CUSTOM_AMOUNT_MAX)}), 400
+            coin_amount = int(base_amount)  # 自定义金额 1 元 = 1 金币，按整数部分到账
+            if coin_amount < 1:
+                return jsonify({'success': False, 'message': '充值金额至少 1 元'}), 400
+
+        # ---- 优惠码（沿用既有规则）----
+        original_amount = base_amount
+        discount_amount = Decimal('0.00')
         coupon_id = None
-        
         if coupon_code:
             coupon = db.query(CouponCode).filter_by(code=coupon_code).first()
             if not coupon:
                 return jsonify({'success': False, 'message': '优惠码不存在'}), 400
-            
             if not coupon.is_valid():
                 return jsonify({'success': False, 'message': '优惠码已失效或已用完'}), 400
-            
-            # 检查受益人规则
-            user_id = session.get('user_id')
-            user = db.query(User).filter_by(id=user_id).first()
-            
+            user = db.query(User).filter_by(id=session.get('user_id')).first()
             if coupon.beneficiary_type == CouponBeneficiary.NEW_USER:
                 if user.created_at:
-                    days_since_registration = (datetime.utcnow() - user.created_at).days
-                    if days_since_registration > 7:
+                    if (datetime.utcnow() - user.created_at).days > 7:
                         return jsonify({'success': False, 'message': '此优惠码仅限新用户使用'}), 400
-            
             elif coupon.beneficiary_type == CouponBeneficiary.SPECIFIC:
-                allowed_user_ids = json.loads(coupon.beneficiary_user_ids) if coupon.beneficiary_user_ids else []
-                if user_id not in allowed_user_ids:
+                allowed = json.loads(coupon.beneficiary_user_ids) if coupon.beneficiary_user_ids else []
+                if session.get('user_id') not in allowed:
                     return jsonify({'success': False, 'message': '您不在该优惠码的使用范围内'}), 400
-            
-            # 计算优惠金额（保留两位小数，四舍五入）
-            from decimal import Decimal, ROUND_HALF_UP
-            amount_dec = Decimal(str(amount))
-            discount_amount = (amount_dec * Decimal(str(coupon.discount_percent)) / Decimal('100')).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-            final_amount = amount_dec - discount_amount
+            discount_amount = (base_amount * Decimal(str(coupon.discount_percent))
+                               / Decimal('100')).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
             coupon_id = coupon.id
-        
-        # 生成订单号
-        order_no = 'PAY' + datetime.now().strftime('%Y%m%d%H%M%S') + str(session['user_id']).zfill(4)
-        
-        # 创建支付订单
-        # 金币数量应该基于原始金额（优惠前的金额），因为优惠只是价格优惠，不影响获得的金币数
-        coin_amount = original_amount
-        order_amount = float(final_amount) if coupon_code else amount
-        order_original_amount = float(amount_dec) if coupon_code else None
-        order_discount_amount = float(discount_amount) if coupon_code else None
+
+        final_amount = (base_amount - discount_amount).quantize(Decimal('0.01'))
+        if final_amount < Decimal('0.01'):
+            return jsonify({'success': False, 'message': '优惠后金额异常'}), 400
+
+        order_no = 'PAY' + datetime.now().strftime('%Y%m%d%H%M%S') + str(session['user_id']).zfill(4) + secrets.token_hex(2)
         order = PaymentOrder(
             order_no=order_no,
             user_id=session['user_id'],
-            amount=order_amount,  # 实际支付金额
-            coin_amount=coin_amount,  # 获得的金币数量（基于原始金额）
-            payment_method=payment_method,
+            amount=float(final_amount),
+            coin_amount=coin_amount,
+            payment_method=channel.code[:20],
             status='pending',
-            coupon_code=coupon_code if coupon_code else None,
-            original_amount=order_original_amount,
-            discount_amount=order_discount_amount,
-            coupon_id=coupon_id
+            coupon_code=coupon_code or None,
+            original_amount=float(base_amount) if coupon_code else None,
+            discount_amount=float(discount_amount) if coupon_code else None,
+            coupon_id=coupon_id,
+            channel_id=channel.id,
         )
         db.add(order)
-        db.commit()
+        db.flush()  # 取得 order_no，远端下单失败可整体回滚
 
-        actual_amount = final_amount if coupon_code else amount
-        logger.info(f"用户 {session['user_id']} 创建支付订单 {order_no}，支付 {actual_amount} 元（原价 {original_amount}，优惠 {discount_amount}），获得 {coin_amount} 金币，方式 {payment_method}")
+        # ---- API 渠道：服务端下单，返回支付链接/二维码串 ----
+        pay_info = {}
+        if gateway.supports_notify:
+            notify_url = request.host_url.rstrip('/') + '/api/payment/notify/' + channel.code
+            return_url = request.host_url.rstrip('/') + '/user/payment?order=' + order_no
+            try:
+                pay_info = gateway.create_order(
+                    channel, order_no, final_amount,
+                    '金币充值 %s' % order_no, notify_url, return_url) or {}
+            except Exception as e:
+                db.rollback()
+                logger.error("渠道 %s 下单失败 %s: %s", channel.code, order_no, e)
+                return jsonify({'success': False,
+                                'message': '支付渠道暂时不可用，请稍后重试或更换支付方式'}), 502
+            # 持久化支付凭据（二维码串/跳转链接），供用户支付页拉取展示
+            order.pay_payload = pay_info.get('qr_code') or pay_info.get('pay_url')
+
+        db.commit()
+        logger.info("用户 %s 创建订单 %s，档位金额 %s，实付 %s，金币 %s，渠道 %s(%s)",
+                    session['user_id'], order_no, base_amount, final_amount,
+                    coin_amount, channel.code, channel.type)
 
         return jsonify({
             'success': True,
             'message': '订单创建成功',
             'data': {
                 'order_no': order_no,
-                'amount': order_amount,
-                'original_amount': order_original_amount,
-                'discount_amount': order_discount_amount,
+                'amount': float(final_amount),
+                'original_amount': float(base_amount) if coupon_code else None,
+                'discount_amount': float(discount_amount) if coupon_code else None,
                 'coin_amount': coin_amount,
-                'payment_method': payment_method,
-                'coupon_code': coupon_code if coupon_code else None
+                'channel_code': channel.code,
+                'channel_type': channel.type,
+                'channel_name': channel.name,
+                'online': bool(gateway.supports_notify),
+                'qrcode_url': ('/' + channel.qrcode_path.replace('\\', '/'))
+                              if channel.qrcode_path else None,
+                'pay_url': pay_info.get('pay_url'),
+                'qr_code': pay_info.get('qr_code'),
+                'coupon_code': coupon_code or None,
             }
         })
     except Exception as e:
         db.rollback()
         logger.error(f"创建支付订单失败: {e}")
         return jsonify({'success': False, 'message': '创建订单失败'}), 500
+    finally:
+        db.close()
+
+
+# 渠道异步回调（无登录态，安全完全依赖验签；切勿在此信任任何未验签数据）
+@app.route('/api/payment/notify/<string:channel_code>', methods=['POST'])
+def api_payment_notify(channel_code):
+    channel_code = (channel_code or '').strip().lower()
+    db = get_db()
+    # 注意：get_config 会关闭当前线程共享会话，必须在加载任何 ORM 对象之前读取
+    manual_review_off = get_config('payment_manual_review', 'on') != 'on'
+    try:
+        channel = db.query(PaymentChannel).filter_by(code=channel_code).first()
+        if not channel or not channel.is_active:
+            logger.warning("支付回调：渠道不存在或已停用 %s", channel_code)
+            return 'channel unavailable', 404
+        gateway = payment_gateways.get_gateway(channel.type)
+        if gateway is None or not gateway.supports_notify:
+            return 'notify unsupported', 400
+
+        raw_body = request.get_data(as_text=True)
+        result = gateway.verify_notify(channel, raw_body, dict(request.headers),
+                                       request.args, request.form)
+        if not result.ok:
+            logger.warning("支付回调验签失败 channel=%s order=%s reason=%s",
+                           channel_code, result.order_no, result.reason)
+            return gateway.ack(False)
+
+        order = db.query(PaymentOrder).filter_by(order_no=result.order_no).first()
+        if not order:
+            logger.warning("支付回调：订单不存在 %s", result.order_no)
+            return gateway.ack(False)
+        if order.channel_id != channel.id:
+            logger.warning("支付回调：订单渠道不匹配 order=%s", result.order_no)
+            return gateway.ack(False)
+        # 金额一致性校验（防小额支付大额入账）
+        notify_amount = Decimal(str(result.amount_yuan)).quantize(Decimal('0.01'))
+        order_amount = Decimal(str(order.amount)).quantize(Decimal('0.01'))
+        if notify_amount != order_amount:
+            logger.warning("支付回调金额不一致 order=%s notify=%s order_amount=%s",
+                           result.order_no, notify_amount, order_amount)
+            return gateway.ack(False)
+
+        if not result.paid:
+            return gateway.ack(True)  # 验签通过但未支付（如 WAIT_BUYER_PAY），幂等应答
+
+        auto_grant = manual_review_off
+        try:
+            state = _apply_channel_payment(db, order, result.trade_no, auto_grant)
+            if state == 'coupon_exhausted':
+                # 优惠码并发超额：不放行、不入账，让网关重试并转人工处理
+                db.rollback()
+                logger.warning("支付回调优惠码已不可用，转人工 order=%s", result.order_no)
+                return gateway.ack(False)
+            db.commit()
+        except IntegrityError:
+            # 渠道流水号唯一冲突：可能是同一笔回调的并发/重放，也可能是渠道流水串单
+            db.rollback()
+            dup = db.query(PaymentOrder).filter_by(
+                channel_trade_no=str(result.trade_no)[:64]).first()
+            if dup is not None and dup.order_no == result.order_no:
+                logger.info("支付回调重复投递（幂等）order=%s", result.order_no)
+                return gateway.ack(True)
+            logger.warning("支付回调流水号串单冲突 order=%s trade=%s",
+                           result.order_no, result.trade_no)
+            return gateway.ack(False)
+        logger.info("支付回调处理 order=%s state=%s auto=%s",
+                    result.order_no, state, auto_grant)
+        return gateway.ack(True)
+    except Exception as e:
+        db.rollback()
+        logger.error("处理支付回调异常 channel=%s: %s", channel_code, e)
+        return 'internal error', 500
+    finally:
+        db.close()
+
+
+# 用户主动查单（仅本人订单，5 秒节流；API 渠道成功则走同一幂等入账）
+@app.route('/api/user/payment-order/<string:order_no>/query', methods=['GET'])
+@login_required
+def api_user_payment_order_query(order_no):
+    now_ts = time.time()
+    last = _last_order_query.get((session['user_id'], order_no), 0)
+    if now_ts - last < 5:
+        return jsonify({'success': False, 'message': '操作过于频繁，请稍候'}), 429
+    _last_order_query[(session['user_id'], order_no)] = now_ts
+
+    db = get_db()
+    # get_config 会关闭线程共享会话，须在加载 ORM 对象前读取
+    auto_grant = get_config('payment_manual_review', 'on') != 'on'
+    try:
+        order = db.query(PaymentOrder).filter_by(order_no=order_no).first()
+        if not order or order.user_id != session['user_id']:
+            return jsonify({'success': False, 'message': '订单不存在'}), 404
+        channel = order.channel
+        gateway = payment_gateways.get_gateway(channel.type) if channel else None
+        if channel and channel.is_active and gateway and gateway.supports_query and order.status in ('pending', 'paid'):
+            try:
+                info = gateway.query_order(channel, order_no)
+            except Exception as e:
+                logger.warning("主动查单失败 order=%s: %s", order_no, e)
+                info = None
+            if info and info.get('paid'):
+                paid_amount = Decimal(str(info['amount_yuan'])).quantize(Decimal('0.01')) if info.get('amount_yuan') is not None else None
+                if paid_amount is None or paid_amount == Decimal(str(order.amount)).quantize(Decimal('0.01')):
+                    try:
+                        _state = _apply_channel_payment(db, order, info.get('trade_no'), auto_grant)
+                        if _state == 'coupon_exhausted':
+                            db.rollback()
+                        else:
+                            db.commit()
+                    except IntegrityError:
+                        db.rollback()
+        db.refresh(order)
+        return jsonify({'success': True, 'data': order.to_dict()})
+    except Exception as e:
+        db.rollback()
+        logger.error("查询支付订单失败: %s", e)
+        return jsonify({'success': False, 'message': '查询失败'}), 500
+    finally:
+        db.close()
+
+
+# 在线渠道支付凭据二维码（仅本人订单；内容来自服务端下单结果，不接受客户端传参）
+@app.route('/api/user/payment-order/<string:order_no>/payqrcode')
+@login_required
+def api_payment_pay_qrcode(order_no):
+    db = get_db()
+    try:
+        order = db.query(PaymentOrder).filter_by(order_no=order_no).first()
+        if not order or order.user_id != session['user_id']:
+            return 'order not found', 404
+        payload = order.pay_payload or ''
+        channel = order.channel
+        if not payload or not channel:
+            return 'not available', 404
+        gateway = payment_gateways.get_gateway(channel.type)
+        if not gateway or not gateway.supports_notify:
+            return 'not available', 404
+        # http(s)/收银台链接与码串都渲染成二维码，由对应 App 扫码识别
+        import qrcode as _qrcode
+        import io as _io
+        img = _qrcode.make(payload[:1024], box_size=8, border=2)
+        buf = _io.BytesIO()
+        img.save(buf, format='PNG')
+        resp = Response(buf.getvalue(), mimetype='image/png')
+        resp.headers['Cache-Control'] = 'no-store'
+        return resp
     finally:
         db.close()
 
@@ -11415,36 +12164,102 @@ def api_create_recharge():
 @app.route('/api/admin/payment-orders', methods=['GET'])
 @admin_required
 def api_get_payment_orders():
-    """获取支付订单列表（管理员，支持分页）"""
+    """获取支付订单列表（管理员，支持分页、搜索、时间筛选）"""
     status = request.args.get('status', 'paid')  # 默认获取已支付待审核的
-    
+
+    # 搜索与时间筛选参数
+    scope = request.args.get('scope', 'all').strip() or 'all'
+    q = request.args.get('q', '').strip()
+    date_from_str = request.args.get('date_from', '').strip()
+    date_to_str = request.args.get('date_to', '').strip()
+
     # 获取分页参数
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 20, type=int)
-    
+
     # 限制每页最大记录数
     if per_page > 100:
         per_page = 100
-    
+    if per_page < 1:
+        per_page = 10
+
     # 计算偏移量
     offset = (page - 1) * per_page
-    
+
+    # 解析日期范围
+    date_from = None
+    date_to = None
+    if date_from_str:
+        try:
+            date_from = datetime.strptime(date_from_str[:10], '%Y-%m-%d').replace(hour=0, minute=0, second=0, microsecond=0)
+        except ValueError:
+            date_from = None
+    if date_to_str:
+        try:
+            date_to = datetime.strptime(date_to_str[:10], '%Y-%m-%d').replace(hour=23, minute=59, second=59, microsecond=0)
+        except ValueError:
+            date_to = None
+
     db = get_db()
     try:
         query = db.query(PaymentOrder)
         # 只有当status不是'all'时才过滤
         if status and status != 'all':
             query = query.filter_by(status=status)
-        
+
+        # 搜索筛选
+        if q:
+            scope = scope if scope in ('all', 'username', 'amount', 'coupon', 'order_no', 'channel', 'coin') else 'all'
+            if scope == 'username':
+                query = query.outerjoin(PaymentOrder.user).filter(User.username.ilike(f'%{q}%'))
+            elif scope == 'amount':
+                try:
+                    amount_val = Decimal(q)
+                    query = query.filter(func.abs(PaymentOrder.amount - amount_val) < Decimal('0.01'))
+                except (InvalidOperation, ValueError):
+                    pass
+            elif scope == 'coupon':
+                query = query.filter(PaymentOrder.coupon_code.ilike(f'%{q}%'))
+            elif scope == 'order_no':
+                query = query.filter(PaymentOrder.order_no.ilike(f'%{q}%'))
+            elif scope == 'channel':
+                query = query.outerjoin(PaymentOrder.channel).filter(
+                    or_(
+                        PaymentChannel.name.ilike(f'%{q}%'),
+                        PaymentChannel.code.ilike(f'%{q}%'),
+                        PaymentChannel.type.ilike(f'%{q}%'),
+                    )
+                )
+            elif scope == 'coin':
+                try:
+                    coin_val = int(q)
+                    query = query.filter(PaymentOrder.coin_amount == coin_val)
+                except ValueError:
+                    pass
+            else:  # all — 在所有常用字段上 OR 匹配
+                query = query.outerjoin(PaymentOrder.user).filter(
+                    or_(
+                        User.username.ilike(f'%{q}%'),
+                        PaymentOrder.order_no.ilike(f'%{q}%'),
+                        PaymentOrder.coupon_code.ilike(f'%{q}%'),
+                    )
+                )
+
+        # 时间筛选
+        if date_from is not None:
+            query = query.filter(PaymentOrder.created_at >= date_from)
+        if date_to is not None:
+            query = query.filter(PaymentOrder.created_at <= date_to)
+
         # 获取总记录数
         total = query.count()
-        
+
         # 获取分页数据
         orders = query.order_by(PaymentOrder.created_at.desc()).offset(offset).limit(per_page).all()
-        
+
         # 计算总页数
         total_pages = (total + per_page - 1) // per_page
-        
+
         return jsonify({
             'success': True,
             'data': [order.to_dict() for order in orders],
@@ -11468,59 +12283,23 @@ def api_approve_payment_order(order_no):
         order = db.query(PaymentOrder).filter_by(order_no=order_no).first()
         if not order:
             return jsonify({'success': False, 'message': '订单不存在'}), 404
-        
+
         if order.status != 'paid':
-            return jsonify({'success': False, 'message': '订单状态错误'}), 400
-        
-        # 更新订单状态
-        order.status = 'approved'
-        order.approved_at = datetime.now()
-        order.approved_by = session['user_id']
-        
-        # 增加用户金币
-        user_coin = db.query(UserCoin).filter_by(user_id=order.user_id).first()
-        if not user_coin:
-            user_coin = UserCoin(user_id=order.user_id, balance=0, total_recharged=0, total_spent=0)
-            db.add(user_coin)
-        
-        user_coin.balance += order.coin_amount
-        user_coin.total_recharged += order.coin_amount
-        
-        # 创建金币交易记录
-        transaction = CoinTransaction(
-            user_id=order.user_id,
-            amount=order.coin_amount,
-            type='recharge',
-            reason=f'充值订单 {order_no} 审核通过',
-            created_by=session['user_id']
-        )
-        db.add(transaction)
-        
-        # 如果使用了优惠码，记录使用情况
-        if order.coupon_id and order.coupon_code:
-            coupon = db.query(CouponCode).filter_by(id=order.coupon_id).first()
-            if coupon:
-                # 增加优惠码使用次数
-                coupon.current_uses += 1
-                
-                # 创建优惠码使用记录
-                usage_record = CouponUsageRecord(
-                    coupon_id=coupon.id,
-                    user_id=order.user_id,
-                    order_no=order.order_no,
-                    original_amount=order.original_amount or order.amount,
-                    discount_amount=order.discount_amount or 0,
-                    final_amount=order.amount,
-                    used_at=datetime.now()
-                )
-                db.add(usage_record)
-                
-                logger.info(f"优惠码 {order.coupon_code} 被使用，订单 {order_no}，优惠金额 {order.discount_amount} 元")
-        
-        db.commit()
-        
+            return jsonify({'success': False, 'message': '订单状态错误或已处理'}), 400
+
+        # 发金币 + 记录（CAS 原子入账：并发回调/重复审核不会重复发币）
+        grant_result = _grant_recharge_coins(db, order, admin_id=session['user_id'], auto=False)
+        if grant_result == 'granted':
+            db.commit()
+        else:
+            db.rollback()
+            if grant_result == 'coupon_exhausted':
+                return jsonify({'success': False,
+                                'message': '该订单使用的优惠码已达使用上限，请核实后再处理'}), 400
+            return jsonify({'success': False, 'message': '订单状态错误或已处理，请勿重复审核'}), 400
+
         logger.info(f"管理员 {session['user_id']} 审核通过支付订单 {order_no}，用户 {order.user_id} 获得 {order.coin_amount} 金币")
-        
+
         return jsonify({
             'success': True,
             'message': '审核通过成功'
@@ -11637,6 +12416,552 @@ def api_batch_delete_payment_orders():
     finally:
         db.close()
 
+# ================= 支付管理：渠道 / 档位 / 设置 / 初始化 API =================
+
+def _payment_notify_url(channel_code):
+    """生成渠道异步回调地址（优先使用请求来源，便于管理员直接复制到商户后台）"""
+    try:
+        return request.host_url.rstrip('/') + '/api/payment/notify/' + channel_code
+    except Exception:
+        return '/api/payment/notify/' + channel_code
+
+
+# 支付品牌 → 官方标准 Logo（Font Awesome 品牌图标，全站唯一映射源）
+BRAND_ICONS = {
+    'alipay': 'fab fa-alipay',       # 支付宝
+    'wechat': 'fab fa-weixin',       # 微信支付
+    'qqpay': 'fab fa-qq',            # QQ 钱包
+    'bank': 'fas fa-credit-card',  # 银行卡 / 网银（卡片形，区别于银行大楼图标）
+    'stripe': 'fab fa-stripe',       # Stripe
+    'jd': 'fas fa-shopping-bag',     # 京东支付
+    'hupijiao': 'fas fa-leaf',       # 虎皮椒
+    'epay': 'fas fa-wallet',         # 易支付（未匹配具体品牌时的通用在线支付）
+    'qrcode': 'fas fa-qrcode',       # 通用个人收款码
+}
+
+# 个人收款码「二维码类型」合法值（与 payment_gateways.CHANNEL_SPEC 选项保持一致）
+STATIC_QR_BRANDS = ('alipay', 'wechat', 'qqpay', 'bank', 'qrcode')
+
+
+def _channel_brand(channel):
+    """订单/渠道展示用品牌标识：
+    - 个人收款码优先取管理员选择的「二维码类型」(config.qr_brand)，旧数据回退按渠道标识推断；
+    - 易支付依据「默认支付方式编码」(pay_type) 动态匹配实际支付品牌。
+    返回：alipay/wechat/qqpay/bank/stripe/jd/hupijiao/epay/qrcode"""
+    ctype = channel.type
+    if ctype == 'static_qrcode':
+        qr_brand = (channel.get_config().get('qr_brand') or '').strip().lower()
+        if qr_brand in STATIC_QR_BRANDS and qr_brand != 'qrcode':
+            return qr_brand
+        if qr_brand == 'qrcode':
+            return 'qrcode'
+        # 兼容旧数据：未配置二维码类型时按渠道标识推断
+        low = (channel.code or '').lower()
+        if 'wechat' in low or 'wx' in low or 'weixin' in low:
+            return 'wechat'
+        if 'alipay' in low or 'ali' in low:
+            return 'alipay'
+        return 'qrcode'
+    if ctype == 'alipay_f2f':
+        return 'alipay'
+    if ctype == 'wechat_native':
+        return 'wechat'
+    if ctype == 'epay':
+        pay_type = (channel.get_config().get('pay_type') or 'alipay').strip().lower()
+        return {'alipay': 'alipay', 'wxpay': 'wechat', 'wechat': 'wechat',
+                'qqpay': 'qqpay', 'bank': 'bank'}.get(pay_type, 'epay')
+    if ctype in ('stripe', 'jd', 'hupijiao'):
+        return ctype
+    return 'epay'
+
+
+def _channel_display_icon(channel, spec_icon=None):
+    """展示图标：统一按品牌匹配官方标准 Logo；无法识别品牌时回退类型规范图标"""
+    try:
+        brand = _channel_brand(channel)
+    except Exception:
+        brand = None
+    if brand and brand in BRAND_ICONS:
+        # 通用品牌（易支付未匹配/通用收款码）优先使用类型自带图标，保证语义一致
+        if brand in ('epay', 'qrcode'):
+            return spec_icon or BRAND_ICONS[brand]
+        return BRAND_ICONS[brand]
+    return spec_icon or 'fas fa-credit-card'
+
+
+def _channel_admin_dict(channel):
+    """渠道管理端 DTO：敏感凭证永不回显明文，仅返回 *** 占位或未配置状态"""
+    d = channel.to_dict()
+    spec = payment_gateways.CHANNEL_SPEC.get(channel.type, {})
+    creds = channel.get_credentials()
+    fields = []
+    for f in spec.get('credential_fields', []):
+        key = f['key']
+        kind = f.get('kind', 'text')
+        is_secret = kind in ('secret', 'textarea_secret')
+        fields.append({
+            'key': key,
+            'label': f['label'],
+            'kind': kind,
+            'group': f.get('group') or '',
+            'required': f.get('required', True),
+            'placeholder': f.get('placeholder', ''),
+            'help': f.get('help', ''),
+            'value': ('***' if is_secret and creds.get(key) else (creds.get(key) if not is_secret else '')),
+            'configured': bool(creds.get(key)),
+        })
+    d['type_label'] = spec.get('label', channel.type)
+    d['brand'] = _channel_brand(channel)
+    d['icon'] = _channel_display_icon(channel, spec.get('icon'))
+    d['supports_notify'] = spec.get('supports_notify', False)
+    d['supports_query'] = spec.get('supports_query', False)
+    d['hint'] = spec.get('hint', '')
+    d['credential_fields'] = fields
+    d['config_spec'] = spec.get('config_fields', [])
+    d['notify_url'] = _payment_notify_url(channel.code) if spec.get('supports_notify') else None
+    return d
+
+
+def _validate_channel_payload(data, partial=False):
+    """校验并归一化渠道入参。返回 (name, type, code, is_active, sort_order, error)"""
+    name = (data.get('name') or '').strip()
+    ctype = (data.get('type') or '').strip()
+    # 渠道标识严格按白名单校验：仅允许小写字母/数字/下划线，不做静默大小写转换，前后端规则一致
+    code = (data.get('code') or '').strip()
+    if not partial or data.get('is_active') is not None:
+        is_active = bool(data.get('is_active', True))
+    else:
+        is_active = None
+    try:
+        sort_order = int(data.get('sort_order', 0))
+    except (TypeError, ValueError):
+        sort_order = 0
+    if not partial:
+        if not name or len(name) > 100:
+            return None, '渠道名称无效'
+        if ctype not in payment_gateways.CHANNEL_SPEC:
+            return None, '渠道类型无效'
+        if not re.match(r'^[a-z0-9_]{2,50}$', code):
+            return None, '渠道标识需为 2-50 位小写字母、数字或下划线'
+    return {'name': name, 'type': ctype, 'code': code,
+            'is_active': is_active, 'sort_order': sort_order}, None
+
+
+def _save_channel_secrets(channel, data, partial=False):
+    """按 schema 白名单写入凭证与非密配置；密钥类字段留空表示不修改。
+    返回错误消息或 None。"""
+    spec = payment_gateways.CHANNEL_SPEC.get(channel.type)
+    if not spec:
+        return '渠道类型无效'
+    incoming_creds = data.get('credentials')
+    incoming_config = data.get('config')
+    if incoming_creds is not None and not isinstance(incoming_creds, dict):
+        return '凭证数据格式错误'
+    if incoming_config is not None and not isinstance(incoming_config, dict):
+        return '配置数据格式错误'
+
+    creds = channel.get_credentials()
+    allowed_cred = {f['key'] for f in spec['credential_fields']}
+    if incoming_creds is not None:
+        secret_keys = {f['key'] for f in spec['credential_fields']
+                       if f.get('kind') in ('secret', 'textarea_secret')}
+        for key in allowed_cred:
+            if key not in incoming_creds:
+                continue
+            val = incoming_creds.get(key)
+            if val is None:
+                continue
+            val = str(val).strip()
+            if key in secret_keys:
+                if val == '' or val == '***':
+                    continue  # 留空/占位：保持原值
+                if len(val) > 8000:
+                    return '凭证内容过长'
+            else:
+                if len(val) > 200:
+                    return '凭证字段过长'
+            creds[key] = val
+    channel.set_credentials(creds)
+
+    conf = channel.get_config()
+    allowed_conf = {f['key'] for f in spec.get('config_fields', [])}
+    if incoming_config is not None:
+        for key in allowed_conf:
+            if key in incoming_config:
+                val = str(incoming_config.get(key) or '').strip()
+                if len(val) > 300:
+                    return '配置内容过长'
+                conf[key] = val
+    channel.set_config(conf)
+    return None
+
+
+@app.route('/api/admin/payment/channels', methods=['GET'])
+@admin_required
+def api_admin_payment_channels():
+    """渠道列表（含类型元数据与脱敏凭证）"""
+    db = get_db()
+    try:
+        channels = db.query(PaymentChannel).order_by(
+            PaymentChannel.sort_order.asc(), PaymentChannel.id.asc()).all()
+        return jsonify({'success': True,
+                        'data': [_channel_admin_dict(c) for c in channels],
+                        'types': payment_gateways.CHANNEL_SPEC})
+    finally:
+        db.close()
+
+
+@app.route('/api/admin/payment/channels', methods=['POST'])
+@admin_required
+def api_admin_payment_channel_create():
+    data = request.get_json(silent=True) or {}
+    payload, err = _validate_channel_payload(data)
+    if err:
+        return jsonify({'success': False, 'message': err}), 400
+    db = get_db()
+    try:
+        if db.query(PaymentChannel).filter_by(code=payload['code']).first():
+            return jsonify({'success': False, 'message': '渠道标识已存在'}), 400
+        channel = PaymentChannel(
+            code=payload['code'], name=payload['name'], type=payload['type'],
+            is_active=payload['is_active'], sort_order=payload['sort_order'])
+        serr = _save_channel_secrets(channel, data)
+        if serr:
+            return jsonify({'success': False, 'message': serr}), 400
+        db.add(channel)
+        db.commit()
+        logger.info("管理员 %s 创建支付渠道 %s(%s)", session.get('user_id'),
+                    channel.code, channel.type)
+        return jsonify({'success': True, 'message': '渠道创建成功',
+                        'data': _channel_admin_dict(channel)})
+    except Exception as e:
+        db.rollback()
+        logger.error("创建支付渠道失败: %s", e)
+        return jsonify({'success': False, 'message': '创建失败'}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/admin/payment/channels/<int:channel_id>', methods=['PUT'])
+@admin_required
+def api_admin_payment_channel_update(channel_id):
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+    try:
+        channel = db.query(PaymentChannel).get(channel_id)
+        if not channel:
+            return jsonify({'success': False, 'message': '渠道不存在'}), 404
+        if data.get('name') is not None:
+            name = str(data.get('name') or '').strip()
+            if not name or len(name) > 100:
+                return jsonify({'success': False, 'message': '渠道名称无效'}), 400
+            channel.name = name
+        if data.get('is_active') is not None:
+            channel.is_active = bool(data.get('is_active'))
+        if data.get('sort_order') is not None:
+            try:
+                channel.sort_order = int(data.get('sort_order'))
+            except (TypeError, ValueError):
+                pass
+        serr = _save_channel_secrets(channel, data, partial=True)
+        if serr:
+            return jsonify({'success': False, 'message': serr}), 400
+        db.commit()
+        logger.info("管理员 %s 更新支付渠道 %s", session.get('user_id'), channel.code)
+        return jsonify({'success': True, 'message': '渠道更新成功',
+                        'data': _channel_admin_dict(channel)})
+    except Exception as e:
+        db.rollback()
+        logger.error("更新支付渠道失败: %s", e)
+        return jsonify({'success': False, 'message': '更新失败'}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/admin/payment/channels/<int:channel_id>/toggle', methods=['POST'])
+@admin_required
+def api_admin_payment_channel_toggle(channel_id):
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+    try:
+        channel = db.query(PaymentChannel).get(channel_id)
+        if not channel:
+            return jsonify({'success': False, 'message': '渠道不存在'}), 404
+        channel.is_active = bool(data.get('is_active'))
+        db.commit()
+        return jsonify({'success': True, 'is_active': bool(channel.is_active)})
+    except Exception:
+        db.rollback()
+        return jsonify({'success': False, 'message': '操作失败'}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/admin/payment/channels/<int:channel_id>', methods=['DELETE'])
+@admin_required
+def api_admin_payment_channel_delete(channel_id):
+    db = get_db()
+    try:
+        channel = db.query(PaymentChannel).get(channel_id)
+        if not channel:
+            return jsonify({'success': False, 'message': '渠道不存在'}), 404
+        used = db.query(PaymentOrder.id).filter_by(channel_id=channel_id).first()
+        if used:
+            return jsonify({'success': False,
+                            'message': '该渠道已有关联订单，无法删除；如需停用请关闭启用开关'}), 400
+        if channel.qrcode_path and os.path.exists(channel.qrcode_path):
+            try:
+                os.remove(channel.qrcode_path)
+            except OSError:
+                pass
+        db.delete(channel)
+        db.commit()
+        logger.info("管理员 %s 删除支付渠道 %s", session.get('user_id'), channel.code)
+        return jsonify({'success': True, 'message': '渠道已删除'})
+    except Exception as e:
+        db.rollback()
+        logger.error("删除支付渠道失败: %s", e)
+        return jsonify({'success': False, 'message': '删除失败'}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/admin/payment/channels/<int:channel_id>/qrcode', methods=['POST'])
+@admin_required
+def api_admin_payment_channel_qrcode(channel_id):
+    """静态收款码渠道上传/替换收款码（魔数 + 扩展名 + 5MB）"""
+    db = get_db()
+    try:
+        channel = db.query(PaymentChannel).get(channel_id)
+        if not channel:
+            return jsonify({'success': False, 'message': '渠道不存在'}), 404
+        if channel.type != 'static_qrcode':
+            return jsonify({'success': False, 'message': '仅个人收款码渠道支持上传图片'}), 400
+        upload = request.files.get('qrcode')
+        if not upload or upload.filename == '':
+            return jsonify({'success': False, 'message': '请选择图片文件'}), 400
+        ext = upload.filename.rsplit('.', 1)[1].lower() if '.' in upload.filename else ''
+        if ext not in {'png', 'jpg', 'jpeg', 'gif'}:
+            return jsonify({'success': False, 'message': '只支持 PNG、JPG、JPEG、GIF 格式'}), 400
+        upload.stream.seek(0, os.SEEK_END)
+        size = upload.stream.tell()
+        upload.stream.seek(0)
+        if size > 5 * 1024 * 1024:
+            return jsonify({'success': False, 'message': '图片不能超过 5MB'}), 400
+        head = upload.read(16)
+        upload.seek(0)
+        sig_map = {b'\x89PNG\r\n\x1a\n': 'png', b'\xff\xd8\xff': 'jpg',
+                   b'GIF87a': 'gif', b'GIF89a': 'gif', b'BM': 'bmp'}
+        detected = next((v for k, v in sig_map.items() if head.startswith(k)), None)
+        if detected is None and not (head.startswith(b'RIFF') and b'WEBP' in head):
+            return jsonify({'success': False, 'message': '文件内容不是有效图片'}), 400
+        if detected == 'jpg':
+            detected = 'jpeg'
+        save_dir = os.path.join(BASE_DIR, 'static', 'uploads', 'payment_channels')
+        os.makedirs(save_dir, exist_ok=True)
+        rel_path = os.path.join('static', 'uploads', 'payment_channels',
+                                'channel_%s.%s' % (channel.id, detected))
+        abs_path = os.path.join(BASE_DIR, rel_path)
+        upload.save(abs_path)
+        old = channel.qrcode_path
+        channel.qrcode_path = rel_path.replace('\\', '/')
+        db.commit()
+        if old and old != channel.qrcode_path and os.path.exists(os.path.join(BASE_DIR, old)):
+            try:
+                os.remove(os.path.join(BASE_DIR, old))
+            except OSError:
+                pass
+        return jsonify({'success': True, 'message': '收款码上传成功',
+                        'data': _channel_admin_dict(channel)})
+    except Exception as e:
+        db.rollback()
+        logger.error("上传渠道收款码失败: %s", e)
+        return jsonify({'success': False, 'message': '上传失败'}), 500
+    finally:
+        db.close()
+
+
+# ---------- 充值档位 ----------
+
+@app.route('/api/admin/recharge-tiers', methods=['GET'])
+@admin_required
+def api_admin_recharge_tiers():
+    db = get_db()
+    try:
+        tiers = db.query(RechargeTier).order_by(
+            RechargeTier.sort_order.asc(), RechargeTier.id.asc()).all()
+        return jsonify({'success': True, 'data': [t.to_dict() for t in tiers]})
+    finally:
+        db.close()
+
+
+def _validate_tier_payload(data):
+    name = (str(data.get('name') or '')).strip()
+    if not name or len(name) > 100:
+        return None, '档位名称无效'
+    try:
+        amount = Decimal(str(data.get('amount_yuan'))).quantize(Decimal('0.01'))
+    except Exception:
+        return None, '支付金额无效'
+    if amount < Decimal('0.01') or amount > Decimal('50000'):
+        return None, '支付金额需在 0.01 ~ 50000 元之间'
+    try:
+        coins = int(data.get('coin_amount'))
+    except (TypeError, ValueError):
+        return None, '到账金币必须为正整数'
+    if coins < 1 or coins > 100000000:
+        return None, '到账金币需为 1 ~ 100000000 的整数'
+    try:
+        sort_order = int(data.get('sort_order', 0))
+    except (TypeError, ValueError):
+        sort_order = 0
+    return {'name': name, 'amount': amount, 'coins': coins,
+            'is_active': bool(data.get('is_active', True)), 'sort_order': sort_order}, None
+
+
+@app.route('/api/admin/recharge-tiers', methods=['POST'])
+@admin_required
+def api_admin_recharge_tier_create():
+    data = request.get_json(silent=True) or {}
+    payload, err = _validate_tier_payload(data)
+    if err:
+        return jsonify({'success': False, 'message': err}), 400
+    db = get_db()
+    try:
+        tier = RechargeTier(name=payload['name'], amount_yuan=payload['amount'],
+                            coin_amount=payload['coins'], is_active=payload['is_active'],
+                            sort_order=payload['sort_order'])
+        db.add(tier)
+        db.commit()
+        return jsonify({'success': True, 'message': '档位创建成功', 'data': tier.to_dict()})
+    except Exception as e:
+        db.rollback()
+        logger.error("创建充值档位失败: %s", e)
+        return jsonify({'success': False, 'message': '创建失败'}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/admin/recharge-tiers/<int:tier_id>', methods=['PUT'])
+@admin_required
+def api_admin_recharge_tier_update(tier_id):
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+    try:
+        tier = db.query(RechargeTier).get(tier_id)
+        if not tier:
+            return jsonify({'success': False, 'message': '档位不存在'}), 404
+        if data.get('name') is not None:
+            name = str(data.get('name') or '').strip()
+            if not name or len(name) > 100:
+                return jsonify({'success': False, 'message': '档位名称无效'}), 400
+            tier.name = name
+        if data.get('amount_yuan') is not None:
+            try:
+                amount = Decimal(str(data.get('amount_yuan'))).quantize(Decimal('0.01'))
+            except Exception:
+                return jsonify({'success': False, 'message': '支付金额无效'}), 400
+            if amount < Decimal('0.01') or amount > Decimal('50000'):
+                return jsonify({'success': False, 'message': '支付金额需在 0.01 ~ 50000 元之间'}), 400
+            tier.amount_yuan = amount
+        if data.get('coin_amount') is not None:
+            try:
+                coins = int(data.get('coin_amount'))
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'message': '到账金币必须为正整数'}), 400
+            if coins < 1 or coins > 100000000:
+                return jsonify({'success': False, 'message': '到账金币超范围'}), 400
+            tier.coin_amount = coins
+        if data.get('is_active') is not None:
+            tier.is_active = bool(data.get('is_active'))
+        if data.get('sort_order') is not None:
+            try:
+                tier.sort_order = int(data.get('sort_order'))
+            except (TypeError, ValueError):
+                pass
+        db.commit()
+        return jsonify({'success': True, 'message': '档位更新成功', 'data': tier.to_dict()})
+    except Exception as e:
+        db.rollback()
+        logger.error("更新充值档位失败: %s", e)
+        return jsonify({'success': False, 'message': '更新失败'}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/admin/recharge-tiers/<int:tier_id>', methods=['DELETE'])
+@admin_required
+def api_admin_recharge_tier_delete(tier_id):
+    db = get_db()
+    try:
+        tier = db.query(RechargeTier).get(tier_id)
+        if not tier:
+            return jsonify({'success': False, 'message': '档位不存在'}), 404
+        db.delete(tier)
+        db.commit()
+        return jsonify({'success': True, 'message': '档位已删除'})
+    except Exception:
+        db.rollback()
+        return jsonify({'success': False, 'message': '删除失败'}), 500
+    finally:
+        db.close()
+
+
+# ---------- 支付全局设置与初始化 ----------
+
+@app.route('/api/admin/payment/settings', methods=['GET'])
+@admin_required
+def api_admin_payment_settings():
+    return jsonify({'success': True, 'data': {
+        'manual_review': get_config('payment_manual_review', 'on') == 'on',
+        'custom_amount_enabled': get_config('payment_custom_amount_enabled', 'on') == 'on',
+        'initialized': get_config('payment_initialized', '0') == '1',
+    }})
+
+
+@app.route('/api/admin/payment/settings', methods=['POST'])
+@admin_required
+def api_admin_payment_settings_update():
+    data = request.get_json(silent=True) or {}
+    updates = []
+    if data.get('manual_review') is not None:
+        if not isinstance(data.get('manual_review'), bool):
+            return jsonify({'success': False, 'message': '人工审核开关值无效'}), 400
+        set_config('payment_manual_review', 'on' if data['manual_review'] else 'off')
+        updates.append('manual_review')
+    if data.get('custom_amount_enabled') is not None:
+        if not isinstance(data.get('custom_amount_enabled'), bool):
+            return jsonify({'success': False, 'message': '自定义金额开关值无效'}), 400
+        set_config('payment_custom_amount_enabled', 'on' if data['custom_amount_enabled'] else 'off')
+        updates.append('custom_amount')
+    logger.info("管理员 %s 更新支付设置: %s", session.get('user_id'), ','.join(updates) or 'noop')
+    return jsonify({'success': True, 'message': '设置已保存'})
+
+
+@app.route('/api/admin/payment/init/status', methods=['GET'])
+@admin_required
+def api_admin_payment_init_status():
+    db = get_db()
+    try:
+        return jsonify({'success': True, 'data': {
+            'initialized': get_config('payment_initialized', '0') == '1',
+            'channel_count': db.query(PaymentChannel).count(),
+            'tier_count': db.query(RechargeTier).count(),
+            'manual_review': get_config('payment_manual_review', 'on') == 'on',
+            'custom_amount_enabled': get_config('payment_custom_amount_enabled', 'on') == 'on',
+        }})
+    finally:
+        db.close()
+
+
+@app.route('/api/admin/payment/init/complete', methods=['POST'])
+@admin_required
+def api_admin_payment_init_complete():
+    set_config('payment_initialized', '1')
+    logger.info("管理员 %s 完成支付管理初始化引导", session.get('user_id'))
+    return jsonify({'success': True, 'message': '初始化完成'})
+
+
 # 处理退款申请
 @app.route('/api/admin/payment-orders/<string:order_no>/refund', methods=['POST'])
 @admin_required
@@ -11644,7 +12969,6 @@ def api_process_refund(order_no):
     """处理退款申请"""
     data = request.get_json()
     refund_status = data.get('refund_status')
-    
     if refund_status not in ['refunded', 'rejected']:
         return jsonify({'success': False, 'message': '无效的退款状态'}), 400
     
@@ -12247,7 +13571,16 @@ def send_verification_code():
     
     if not purpose or purpose not in ['register', 'bind', 'forgot_password']:
         return jsonify({'success': False, 'message': '无效的用途参数'}), 400
-    
+
+    # 同一 IP 发送频率限制（防止枚举邮箱、邮件轰炸与验证码撞库；阈值兼顾内网 NAT 多用户）
+    client_ip = request.remote_addr or 'unknown'
+    now_ts = datetime.now()
+    recent_ip_sends = [t for t in email_code_ip_sends.get(client_ip, [])
+                       if (now_ts - t).total_seconds() < EMAIL_CODE_IP_WINDOW]
+    if len(recent_ip_sends) >= EMAIL_CODE_IP_MAX:
+        return jsonify({'success': False, 'message': '当前网络请求验证码过于频繁，请一小时后再试'}), 429
+    email_code_ip_sends[client_ip] = recent_ip_sends
+
     # 检查邮件服务是否配置
     if not EmailService.is_configured():
         return jsonify({'success': False, 'message': '邮件服务未配置，请联系管理员'}), 503
@@ -12295,12 +13628,9 @@ def send_verification_code():
                 user_id = user.id
         
         # 发送邮件
-        print(f"[DEBUG] 即将发送邮件: email={email}, code={code}")
         success, message = EmailService.send_verification_code(email, code, purpose, username)
-        print(f"[DEBUG] 邮件发送结果: success={success}, message={message}")
-        
+
         # 保存验证码到数据库 - 单独事务确保验证码一定被保存
-        print(f"[DEBUG] 准备保存验证码: email={email}, code={code}")
         try:
             verification = EmailVerificationCode(
                 user_id=user_id,  # 允许为None（未登录用户注册场景）
@@ -12312,14 +13642,11 @@ def send_verification_code():
             )
             db.add(verification)
             db.commit()  # 立即提交，确保验证码被保存
-            print(f"[DEBUG] 验证码保存成功! ID={verification.id}")
-            logger.info(f"验证码已保存到数据库: {email}, code={code}, id={verification.id}")
+            # 计入该 IP 的发送频率（验证码不写入任何日志）
+            email_code_ip_sends.setdefault(client_ip, []).append(now_ts)
         except Exception as e:
             db.rollback()
-            print(f"[DEBUG] 保存验证码失败: {e}")
             logger.error(f"保存验证码到数据库失败: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
             raise
         
         # 记录发送日志 - 使用新的会话，不影响验证码保存
@@ -12570,7 +13897,14 @@ def forgot_password_step2():
     
     if not email or not code:
         return jsonify({'success': False, 'message': '请提供邮箱和验证码'}), 400
-    
+
+    # 防爆破：同一邮箱 10 分钟内最多 5 次验证码错误，防止 6 位验证码被穷举
+    now = datetime.now()
+    recent_fails = [t for t in forgot_code_failures.get(email, [])
+                    if (now - t).total_seconds() < FORGOT_CODE_IP_WINDOW]
+    if len(recent_fails) >= FORGOT_CODE_MAX_FAILURES:
+        return jsonify({'success': False, 'message': '验证码错误次数过多，请重新获取验证码'}), 429
+
     db = get_db()
     try:
         # 验证验证码
@@ -12581,10 +13915,19 @@ def forgot_password_step2():
             EmailVerificationCode.is_used == False,
             EmailVerificationCode.expires_at > datetime.now()
         ).order_by(EmailVerificationCode.created_at.desc()).first()
-        
+
         if not verification:
-            return jsonify({'success': False, 'message': '验证码无效或已过期'}), 400
-        
+            recent_fails.append(now)
+            forgot_code_failures[email] = recent_fails
+            remaining = FORGOT_CODE_MAX_FAILURES - len(recent_fails)
+            msg = '验证码无效或已过期'
+            if remaining > 0:
+                msg += f'，还可尝试 {remaining} 次'
+            return jsonify({'success': False, 'message': msg}), 400
+
+        # 验证通过，清除失败计数
+        forgot_code_failures.pop(email, None)
+
         # 标记验证码为已使用（一次性使用）
         verification.is_used = True
         verification.used_at = datetime.now()
@@ -12660,11 +14003,11 @@ def forgot_password_step3():
         emby_user_id = user.emby_user_id
         emby_server_id = user.emby_server_id
 
-        # 生成新密码哈希并更新
+        # 生成新密码哈希并更新（邮箱找回已证明身份，同步解除强制改密标记）
         new_hash = generate_password_hash(new_password)
-        logger.info(f"准备重置密码 - 用户名: {username}, 新哈希前50位: {new_hash[:50]}...")
 
         user.password_hash = new_hash
+        user.must_change_password = False
         db.commit()
         logger.info(f"本地密码重置成功并已提交到数据库: {username}")
     except Exception as e:
@@ -12689,9 +14032,7 @@ def forgot_password_step3():
             logger.error(f"验证失败 - 用户不存在: {email}")
             return jsonify({'success': False, 'message': '验证失败'}), 500
 
-        logger.info(f"数据库验证 - 提交后的密码哈希前50位: {user_check.password_hash[:50]}...")
         verify_result = check_password_hash(user_check.password_hash, new_password)
-        logger.info(f"密码验证测试 - 使用新密码验证: {verify_result}")
 
         if not verify_result:
             # 清除token防止重用
@@ -13937,4 +15278,7 @@ if __name__ == '__main__':
     logger.info("Emby Manager 启动中...")
     app.config['TEMPLATES_AUTO_RELOAD'] = True
     app.jinja_env.auto_reload = True
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    # 默认关闭调试器（Werkzeug debugger 暴露在 0.0.0.0 等同 RCE）；
+    # 仅本地开发时显式设置环境变量 FLASK_DEBUG=1 开启
+    _debug_mode = os.environ.get('FLASK_DEBUG', '') == '1'
+    app.run(host='0.0.0.0', port=5001, debug=_debug_mode)

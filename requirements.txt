@@ -25,6 +25,9 @@ Werkzeug>=2.3.0
 # requests: HTTP 客户端
 requests>=2.25.0
 
+# cryptography: 支付渠道 RSA2/AES-GCM/HMAC 签名验签（支付宝/微信/Stripe 等）
+cryptography>=42.0.0
+
 # ========== 生产服务器 (根据平台自动选择) ==========
 # waitress: 跨平台 WSGI 服务器 (Windows 推荐，Linux/Mac 也可用)
 waitress>=2.0.0
@@ -53,3 +56,4 @@ aiohttp>=3.8.0
 # ========== 缓存 (可选) ==========
 # Redis 缓存
 # redis>=4.0.0
+qrcode[pil]>=8.0

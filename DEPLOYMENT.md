@@ -33,6 +33,9 @@ pip install flask sqlalchemy werkzeug requests
 # 生产环境依赖
 pip install gunicorn waitress flask-compress flask-limiter
 
+# 支付管理依赖（多渠道凭证加密、在线渠道支付二维码生成；requirements.txt 已包含）
+pip install cryptography "qrcode[pil]"
+
 # 性能测试依赖
 pip install aiohttp requests
 
@@ -136,7 +139,16 @@ sudo nginx -t
 sudo systemctl restart nginx
 ```
 
-### 5. 系统优化
+### 5. 支付渠道回调地址配置
+
+支付管理支持个人收款码（人工审核）与在线支付渠道（支付宝当面付、微信 Native、彩虹易支付、虎皮椒、Stripe、京东收银）。在线渠道依赖支付平台服务器主动回调，部署时请注意：
+
+- 回调统一入口为 `https://<你的域名>/api/payment/notify/<渠道code>`，在管理员「支付方式绑定及设置」页的渠道卡片中会按当前访问域名自动展示完整回调地址，配置渠道时需将该地址填入对应支付平台后台。
+- **回调地址必须公网可达**，且建议使用 **HTTPS**（支付平台通常要求），通过上方 Nginx 反向代理终止 SSL；只在内网 / localhost 监听时在线渠道无法自动到账（用户仍可主动查单，但同样需要服务器能访问支付平台 API）。
+- 渠道商户号、密钥 / 私钥等凭证使用 Fernet 对称加密存储，请确保 `EMBY_MANAGER_SECRET_KEY`（或应用密钥）在生产环境固定且不泄露，丢失密钥后历史凭证将无法解密，需重新填写。
+- 「人工支付审核」开关关闭后，仅**在线渠道**验签通过的回调 / 查单会自动发放金币；个人收款码订单始终需要管理员人工审核，不会因关闭开关而自动入账。
+
+### 6. 系统优化
 
 #### Linux系统优化
 
